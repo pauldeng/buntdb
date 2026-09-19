@@ -1,6 +1,6 @@
 module github.com/tidwall/buntdb
 
-go 1.18
+go 1.27
 
 require (
 	github.com/tidwall/assert v0.1.0
