@@ -902,7 +902,13 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		if len(parts) == 0 {
 			continue
 		}
-		if (parts[0][0] == 's' || parts[0][0] == 'S') &&
+		// Each command is matched by exact length, then by byte. The length
+		// check restores the guard commit f240a9c had and b559e28 dropped to
+		// admit the seven-character "flushdb": without it, indexing parts[0]
+		// panicked on a shorter name. It also keeps matching ASCII-only, so a
+		// multi-byte look-alike such as "ſet" (U+017F) cannot pass as SET.
+		if len(parts[0]) == 3 &&
+			(parts[0][0] == 's' || parts[0][0] == 'S') &&
 			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
 			(parts[0][2] == 't' || parts[0][2] == 'T') {
 			// SET
@@ -943,7 +949,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			} else {
 				db.insertIntoDatabase(&dbItem{key: parts[1], val: parts[2]})
 			}
-		} else if (parts[0][0] == 'd' || parts[0][0] == 'D') &&
+		} else if len(parts[0]) == 3 &&
+			(parts[0][0] == 'd' || parts[0][0] == 'D') &&
 			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
 			(parts[0][2] == 'l' || parts[0][2] == 'L') {
 			// DEL
@@ -951,8 +958,7 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 				return totalSize, ErrInvalid
 			}
 			db.deleteFromDatabase(&dbItem{key: parts[1]})
-		} else if (parts[0][0] == 'f' || parts[0][0] == 'F') &&
-			strings.ToLower(parts[0]) == "flushdb" {
+		} else if len(parts[0]) == 7 && strings.EqualFold(parts[0], "flushdb") {
 			db.keys = btreeNew(lessCtx(nil))
 			db.exps = btreeNew(lessCtx(&exctx{db}))
 			db.idxs = make(map[string]*index)
