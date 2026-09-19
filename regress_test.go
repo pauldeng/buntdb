@@ -680,3 +680,92 @@ func TestRegressShrinkReleasesLockOnEarlyFailure(t *testing.T) {
 	// already closed, so the error here is expected and not the subject.
 	_ = db.Close()
 }
+
+// A1: managed() left err nil when the callback did not return normally, so its
+// deferred cleanup took the commit branch. Writes made before a panic were
+// committed, and the same held for runtime.Goexit -- which is why the fix uses
+// a normal-completion flag rather than recover(), since recover() never sees a
+// Goexit.
+//
+// The godoc did not previously say what happens on abnormal exit, so this
+// establishes the contract rather than restoring one.
+func TestRegressAbnormalExitDoesNotCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		exit      func()
+		wantPanic any
+	}{
+		{"panic", func() { panic("callback failed") }, "callback failed"},
+		{"goexit", runtime.Goexit, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// A committed value proves rollback is scoped to this transaction.
+			if err := db.Update(func(tx *Tx) error {
+				_, _, err := tx.Set("before", "kept", nil)
+				return err
+			}); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+
+			var panicValue any
+			var returned bool
+			var updateErr, checkErr error
+			var aborted *Tx
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				// Keep validation and Close inside the timed goroutine: either
+				// can block if transaction cleanup failed to release its lock.
+				defer db.Close()
+				defer func() {
+					panicValue = recover()
+					checkErr = db.View(func(tx *Tx) error {
+						if _, err := tx.Get("during"); err != ErrNotFound {
+							return fmt.Errorf(`"during" survived an aborted transaction (err=%v)`, err)
+						}
+						if v, err := tx.Get("before"); err != nil || v != "kept" {
+							return fmt.Errorf(`"before" lost: %q %v`, v, err)
+						}
+						return nil
+					})
+				}()
+				updateErr = db.Update(func(tx *Tx) error {
+					aborted = tx
+					if _, _, err := tx.Set("during", "must-not-survive", nil); err != nil {
+						return err
+					}
+					tc.exit()
+					return nil
+				})
+				returned = true
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("abnormal transaction cleanup, validation, or Close blocked")
+			}
+
+			if returned {
+				t.Errorf("Update returned normally after %s (err=%v)", tc.name, updateErr)
+			}
+			if panicValue != tc.wantPanic {
+				t.Errorf("panic = %v, want %v", panicValue, tc.wantPanic)
+			}
+			if checkErr != nil {
+				t.Error(checkErr)
+			}
+			if aborted == nil {
+				t.Fatal("callback was not invoked")
+			}
+			if _, err := aborted.Get("during"); err != ErrTxClosed {
+				t.Errorf("aborted transaction Get = %v, want ErrTxClosed", err)
+			}
+		})
+	}
+}

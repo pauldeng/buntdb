@@ -1044,9 +1044,13 @@ func (db *DB) managed(writable bool, fn func(tx *Tx) error) (err error) {
 	if err != nil {
 		return
 	}
+	// Track normal completion so both panic and runtime.Goexit roll back
+	// without recovering the callback's panic.
+	var returned bool
 	defer func() {
-		if err != nil {
-			// The caller returned an error. We must rollback.
+		if !returned || err != nil {
+			// The callback returned an error, panicked, or exited the
+			// goroutine. An incomplete transaction must not be committed.
 			_ = tx.Rollback()
 			return
 		}
@@ -1063,12 +1067,16 @@ func (db *DB) managed(writable bool, fn func(tx *Tx) error) (err error) {
 		tx.funcd = false
 	}()
 	err = fn(tx)
+	returned = true
 	return
 }
 
 // View executes a function within a managed read-only transaction.
 // When a non-nil error is returned from the function that error will be return
 // to the caller of View().
+//
+// If fn panics or calls runtime.Goexit, the transaction is rolled back.
+// Any panic continues to propagate to the caller.
 //
 // Executing a manual commit or rollback from inside the function will result
 // in a panic.
@@ -1081,6 +1089,10 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 // In the event that an error is returned, the transaction will be rolled back.
 // When a non-nil error is returned from the function, the transaction will be
 // rolled back and the that error will be return to the caller of Update().
+//
+// The transaction is committed only when fn returns nil. If fn panics or calls
+// runtime.Goexit, the transaction is rolled back, discarding its writes.
+// Any panic continues to propagate to the caller.
 //
 // Executing a manual commit or rollback from inside the function will result
 // in a panic.
