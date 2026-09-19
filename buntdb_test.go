@@ -659,7 +659,7 @@ func TestVariousTx(t *testing.T) {
 		if _, err := tx.Delete("something"); err != ErrNotFound {
 			t.Fatalf("expecting not found error")
 		}
-		if _, _, err := tx.Set("var", "val", &SetOptions{Expires: true, TTL: 0}); err != nil {
+		if _, _, err := tx.Set("var", "val", &SetOptions{Expires: true, TTL: -time.Nanosecond}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tx.Get("var"); err != ErrNotFound {
