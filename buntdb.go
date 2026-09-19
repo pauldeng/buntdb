@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -786,6 +788,34 @@ func renameFile(src, dest string) error {
 	return err
 }
 
+// minLoadGrowth is the smallest step the load buffer grows by once its current
+// capacity is exhausted. It caps how much memory an over-large declared length
+// can claim speculatively, while keeping the number of copies low for records
+// that really are large.
+const minLoadGrowth = 64 * 1024
+
+// parseRESPLen parses the numeric portion of a RESP header line such as
+// "*3\r\n" or "$12\r\n". The length is untrusted input, so non-digits and
+// arithmetic overflow are rejected rather than wrapping to a negative value.
+func parseRESPLen(line []byte) (int, error) {
+	if len(line) < 4 || line[len(line)-2] != '\r' {
+		return 0, ErrInvalid
+	}
+	var n int
+	for i := 1; i < len(line)-2; i++ {
+		c := line[i]
+		if c < '0' || c > '9' {
+			return 0, ErrInvalid
+		}
+		digit := int(c - '0')
+		if n > (math.MaxInt-digit)/10 {
+			return 0, ErrInvalid
+		}
+		n = n*10 + digit
+	}
+	return n, nil
+}
+
 // readLoad reads from the reader and loads commands into the database.
 // modTime is the modified time of the reader, should be no greater than
 // the current time.Now().
@@ -797,7 +827,7 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		}
 	}()
 	totalSize := int64(0)
-	data := make([]byte, 4096)
+	data := make([]byte, 0, 4096)
 	parts := make([]string, 0, 8)
 	r := bufio.NewReader(rd)
 	for {
@@ -832,26 +862,13 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		cmdByteSize += int64(len(line))
 
 		// convert the string number to and int
-		var n int
-		if len(line) == 4 && line[len(line)-2] == '\r' {
-			if line[1] < '0' || line[1] > '9' {
-				return totalSize, ErrInvalid
-			}
-			n = int(line[1] - '0')
-		} else {
-			if len(line) < 5 || line[len(line)-2] != '\r' {
-				return totalSize, ErrInvalid
-			}
-			for i := 1; i < len(line)-2; i++ {
-				if line[i] < '0' || line[i] > '9' {
-					return totalSize, ErrInvalid
-				}
-				n = n*10 + int(line[i]-'0')
-			}
+		count, err := parseRESPLen(line)
+		if err != nil {
+			return totalSize, err
 		}
 		// read each part of the command.
 		parts = parts[:0]
-		for i := 0; i < n; i++ {
+		for i := 0; i < count; i++ {
 			// read the number of bytes of the part.
 			line, err := r.ReadBytes('\n')
 			if err != nil {
@@ -862,40 +879,51 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			}
 			cmdByteSize += int64(len(line))
 			// convert the string number to and int
-			var n int
-			if len(line) == 4 && line[len(line)-2] == '\r' {
-				if line[1] < '0' || line[1] > '9' {
-					return totalSize, ErrInvalid
-				}
-				n = int(line[1] - '0')
-			} else {
-				if len(line) < 5 || line[len(line)-2] != '\r' {
-					return totalSize, ErrInvalid
-				}
-				for i := 1; i < len(line)-2; i++ {
-					if line[i] < '0' || line[i] > '9' {
-						return totalSize, ErrInvalid
-					}
-					n = n*10 + int(line[i]-'0')
-				}
-			}
-			// resize the read buffer
-			if len(data) < n+2 {
-				dataln := len(data)
-				for dataln < n+2 {
-					dataln *= 2
-				}
-				data = make([]byte, dataln)
-			}
-			if _, err = io.ReadFull(r, data[:n+2]); err != nil {
+			size, err := parseRESPLen(line)
+			if err != nil {
 				return totalSize, err
 			}
-			if data[n] != '\r' || data[n+1] != '\n' {
+			if size > math.MaxInt-2 {
+				return totalSize, ErrInvalid
+			}
+			// Read the part body plus its trailing CRLF. The declared length is
+			// untrusted, so the buffer grows only as bytes actually arrive: a
+			// short header claiming a huge length must not be able to allocate
+			// that much. data is reused across commands, so a file of large
+			// records stops reallocating after the first one.
+			need := size + 2
+			data = data[:0]
+			for len(data) < need {
+				if len(data) == cap(data) {
+					// Grow geometrically with a fixed minimum increment, only
+					// after filling the current buffer. Request no more than
+					// remains; slices.Grow may round up the capacity.
+					grow := minLoadGrowth
+					if cap(data) > minLoadGrowth/3 && cap(data) < math.MaxInt/3 {
+						grow = cap(data) * 3
+					}
+					if grow > need-len(data) {
+						grow = need - len(data)
+					}
+					data = slices.Grow(data, grow)
+				}
+				// Fill the capacity already on hand in one read.
+				want := cap(data) - len(data)
+				if want > need-len(data) {
+					want = need - len(data)
+				}
+				base := len(data)
+				data = data[:base+want]
+				if _, err = io.ReadFull(r, data[base:]); err != nil {
+					return totalSize, err
+				}
+			}
+			if data[size] != '\r' || data[size+1] != '\n' {
 				return totalSize, ErrInvalid
 			}
 			// copy string
-			parts = append(parts, string(data[:n]))
-			cmdByteSize += int64(n + 2)
+			parts = append(parts, string(data[:size]))
+			cmdByteSize += int64(size + 2)
 		}
 		// finished reading the command
 
