@@ -2101,7 +2101,7 @@ func (tx *Tx) CreateSpatialIndex(name, pattern string,
 func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	rect func(item string) (min, max []float64)) error {
-	return tx.createIndex(name, pattern, nil, rect, nil)
+	return tx.createIndex(name, pattern, nil, rect, opts)
 }
 
 // createIndex is called by CreateIndex() and CreateSpatialIndex()
