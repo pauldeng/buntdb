@@ -6,31 +6,54 @@ on:
   pull_request:
     branches: [ master ]
 
+env:
+  # Use exactly the toolchain setup-go installed; fail loudly rather than
+  # silently downloading a different one.
+  GOTOOLCHAIN: local
+
 jobs:
 
-  build:
-    name: Build
-    runs-on: ubuntu-latest
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux plus Windows is the selected coverage scope. renameFile is the
+        # only runtime.GOOS branch in the package, and it is Windows-specific.
+        os: [ubuntu-latest, windows-latest]
+
     steps:
+    # Checkout must precede setup-go: go-version-file reads go.mod.
+    - name: Check out code
+      uses: actions/checkout@v5
 
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v2
+    - name: Set up Go
+      uses: actions/setup-go@v6
       with:
-        go-version: ^1.13
+        # Exactly one version selector. Supplying go-version as well would
+        # override this file.
+        go-version-file: go.mod
 
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v2
-
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-        if [ -f Gopkg.toml ]; then
-            curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
-            dep ensure
-        fi
+    - name: Record toolchain
+      run: go version
 
     - name: Build
-      run: go build -v .
+      run: go build .
+
+    - name: Vet
+      run: go vet .
+
+    - name: Install sync fault-injection tool
+      if: runner.os == 'Linux'
+      run: |
+        if ! command -v strace >/dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y strace
+        fi
 
     - name: Test
-      run: go test -v .
+      env:
+        # The Linux-only test must execute in CI, not skip for a missing tool.
+        BUNTDB_REQUIRE_SYNC_TEST: '1'
+      run: go test -race -count=1 -v .
