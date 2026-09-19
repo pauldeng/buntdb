@@ -2,9 +2,11 @@ name: Go
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
+  # Manual runs from the Actions tab, e.g. to re-verify without a new commit.
+  workflow_dispatch:
 
 env:
   # Use exactly the toolchain setup-go installed; fail loudly rather than
