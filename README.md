@@ -558,6 +558,16 @@ The `Config.SyncPolicy` has the following options:
 - `EverySecond` - fsync every second, fast and safer, this is the default
 - `Always` - fsync after every write, very durable, slower
 
+With `Always`, a failed fsync is returned from the transaction. The error means
+**durability is unconfirmed, not that the transaction was rolled back** - the
+append succeeded and the in-memory changes are kept. Do not treat it as a
+rollback and retry a non-idempotent operation, or it will be applied twice. A
+write error is never replaced by a later sync result. Subsequent operations
+remain allowed, but a sync failure does not establish that storage is healthy.
+
+Background `EverySecond` sync errors are not surfaced. `Close` continues to
+ignore the error from its final sync.
+
 ## Config
 
 Here are some configuration options that can be use to change various behaviors of the database.

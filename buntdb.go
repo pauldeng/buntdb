@@ -98,6 +98,8 @@ const (
 	EverySecond = 1
 	// Always is used to sync data after every write to disk.
 	// Slow. Very safe.
+	// A failed sync is returned from Commit. See Commit for what that does
+	// and does not promise.
 	Always = 2
 )
 
@@ -1085,10 +1087,13 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 }
 
 // Update executes a function within a managed read/write transaction.
-// The transaction has been committed when no error is returned.
-// In the event that an error is returned, the transaction will be rolled back.
-// When a non-nil error is returned from the function, the transaction will be
-// rolled back and the that error will be return to the caller of Update().
+// If fn returns an error, the transaction is rolled back and that error is
+// returned to the caller. If fn returns nil, the transaction is committed and
+// any error from Commit is returned.
+//
+// Under SyncPolicy Always, a sync error leaves the changes applied with
+// durability unconfirmed; it does not mean the transaction was rolled back.
+// See Commit before retrying a non-idempotent operation after an error.
 //
 // The transaction is committed only when fn returns nil. If fn panics or calls
 // runtime.Goexit, the transaction is rolled back, discarding its writes.
@@ -1248,6 +1253,14 @@ func (tx *Tx) rollbackInner() {
 // Commit writes all changes to disk.
 // An error is returned when a write error occurs, or when a Commit() is called
 // from a read-only transaction.
+//
+// Under SyncPolicy Always a failed fsync is also reported. In that case the
+// append itself succeeded and the in-memory changes are kept: the error means
+// durability is unconfirmed, NOT that the transaction was rolled back. Callers
+// must not treat it as a rollback and retry a non-idempotent operation, or
+// they will apply it twice. A write error is never replaced by a later sync
+// result. Subsequent operations remain allowed, but a sync failure does not
+// establish that storage is healthy.
 func (tx *Tx) Commit() error {
 	if tx.funcd {
 		panic("managed tx commit not allowed")
@@ -1298,7 +1311,12 @@ func (tx *Tx) Commit() error {
 			tx.rollbackInner()
 		}
 		if tx.db.config.SyncPolicy == Always {
-			_ = tx.db.file.Sync()
+			// Preserve an append error, whose changes were rolled back above.
+			// After a successful append, a sync failure leaves the changes
+			// applied but their durability unconfirmed.
+			if serr := tx.db.file.Sync(); serr != nil && err == nil {
+				err = serr
+			}
 		}
 		// Increment the number of flushes. The background syncing uses this.
 		tx.db.flushes++
