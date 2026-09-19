@@ -1221,7 +1221,8 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		// contains information about changes to the database.
 		tx.wc = &txWriteContext{}
 		tx.wc.rollbackItems = make(map[string]*dbItem)
-		tx.wc.rollbackIndexes = make(map[string]*index)
+		// rollbackIndexes is created by the first CreateIndex or DropIndex;
+		// most transactions never touch an index definition.
 		if db.persist {
 			tx.wc.commitItems = make(map[string]*dbItem)
 		}
@@ -2271,6 +2272,9 @@ func (tx *Tx) createIndex(name string, pattern string,
 	tx.db.idxs[name] = idx
 	if tx.wc.rbkeys == nil {
 		// store the index in the rollback map.
+		if tx.wc.rollbackIndexes == nil {
+			tx.wc.rollbackIndexes = make(map[string]*index)
+		}
 		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
 			// we use nil to indicate that the index should be removed upon
 			// rollback.
@@ -2302,6 +2306,9 @@ func (tx *Tx) DropIndex(name string) error {
 	delete(tx.db.idxs, name)
 	if tx.wc.rbkeys == nil {
 		// store the index in the rollback map.
+		if tx.wc.rollbackIndexes == nil {
+			tx.wc.rollbackIndexes = make(map[string]*index)
+		}
 		if _, ok := tx.wc.rollbackIndexes[name]; !ok {
 			// we use a non-nil copy of the index without the data to indicate
 			// that the index should be rebuilt upon rollback.
