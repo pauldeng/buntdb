@@ -6,6 +6,7 @@ package buntdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -611,4 +612,71 @@ func Benchmark_Load_LargeValues(b *testing.B) {
 		corpus = appendSet(corpus, fmt.Sprintf("big:%d", i), large, now)
 	}
 	benchmarkLoad(b, corpus)
+}
+
+// A5: Shrink takes db.mu, sets db.shrinking, and registers a deferred cleanup
+// that re-acquires db.mu. If the initial Seek failed, the function returned
+// while still holding the lock, so that cleanup deadlocked against itself.
+//
+// Public-API reachability has not been demonstrated. This test closes the
+// private file to force the error; prior successful I/O does not prove later
+// I/O cannot fail.
+func TestRegressShrinkReleasesLockOnEarlyFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("k", "v", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject: make Shrink's first Seek fail.
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	shrunk := make(chan error, 1)
+	go func() { shrunk <- db.Shrink() }()
+	select {
+	case err := <-shrunk:
+		if !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Shrink error = %v, want the closed-file seek error", err)
+		}
+		t.Logf("Shrink reported the seek failure: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shrink deadlocked against its own deferred cleanup")
+	}
+
+	// A retry must reach Seek again, not return ErrShrinkInProcess because
+	// deferred cleanup forgot to reset db.shrinking. Also verify reads work.
+	// Keep both checks timed so a lock regression reports rather than hangs.
+	released := make(chan error, 1)
+	go func() {
+		if err := db.Shrink(); !errors.Is(err, os.ErrClosed) {
+			released <- fmt.Errorf("Shrink retry = %v, want the closed-file seek error", err)
+			return
+		}
+		released <- db.View(func(tx *Tx) error {
+			if value, err := tx.Get("k"); err != nil || value != "v" {
+				return fmt.Errorf("value after failed Shrink = %q, %v; want v", value, err)
+			}
+			return nil
+		})
+	}()
+	select {
+	case err := <-released:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("db.mu was still held after Shrink returned")
+	}
+
+	// Only safe to close once the lock is known to be free; the file is
+	// already closed, so the error here is expected and not the subject.
+	_ = db.Close()
 }

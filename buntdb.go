@@ -664,6 +664,9 @@ func (db *DB) Shrink() error {
 	// finished writing all of the current items.
 	endpos, err := db.file.Seek(0, 2)
 	if err != nil {
+		// Still holding db.mu here, and the deferred cleanup above re-acquires
+		// it. Returning without unlocking deadlocks against ourselves.
+		db.mu.Unlock()
 		return err
 	}
 	db.mu.Unlock()
