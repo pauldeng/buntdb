@@ -775,7 +775,7 @@ func (db *DB) Shrink() error {
 	}()
 }
 
-func panicErr(err error) error {
+func panicErr(err error) {
 	panic(fmt.Errorf("buntdb: %w", err))
 }
 
