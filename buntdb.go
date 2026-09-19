@@ -1482,7 +1482,15 @@ func (dbi *dbItem) writeDeleteTo(buf []byte) []byte {
 // expired evaluates id the item has expired. This will always return false when
 // the item does not have `opts.ex` set to true.
 func (dbi *dbItem) expired() bool {
-	return dbi.opts != nil && dbi.opts.ex && time.Now().After(dbi.opts.exat)
+	// Kept small enough to inline: the common case is an item with no
+	// expiry, which must not pay a call per scanned item. The clock read is
+	// in expiredNow and runs only for items that can expire.
+	return dbi.opts != nil && dbi.opts.expiredNow()
+}
+
+// expiredNow reports whether an expiring item's deadline has passed.
+func (o *dbItemOpts) expiredNow() bool {
+	return o.ex && time.Now().After(o.exat)
 }
 
 // MaxTime from http://stackoverflow.com/questions/25065055#32620397
