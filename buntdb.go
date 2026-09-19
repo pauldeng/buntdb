@@ -802,23 +802,66 @@ const minLoadGrowth = 64 * 1024
 // parseRESPLen parses the numeric portion of a RESP header line such as
 // "*3\r\n" or "$12\r\n". The length is untrusted input, so non-digits and
 // arithmetic overflow are rejected rather than wrapping to a negative value.
-func parseRESPLen(line []byte) (int, error) {
+func parseRESPLen(line []byte) (n int, ok bool) {
 	if len(line) < 4 || line[len(line)-2] != '\r' {
-		return 0, ErrInvalid
+		return 0, false
 	}
-	var n int
-	for i := 1; i < len(line)-2; i++ {
-		c := line[i]
-		if c < '0' || c > '9' {
-			return 0, ErrInvalid
-		}
-		digit := int(c - '0')
-		if n > (math.MaxInt-digit)/10 {
-			return 0, ErrInvalid
-		}
-		n = n*10 + digit
+	if len(line) == 4 {
+		// Single digit, the common case for array counts. No loop.
+		d := int(line[1] - '0')
+		return d, d <= 9
 	}
-	return n, nil
+	for _, c := range line[1 : len(line)-2] {
+		// c-'0' wraps for bytes below '0', so one unsigned compare rejects
+		// every non-digit.
+		d := int(c - '0')
+		if d > 9 {
+			return 0, false
+		}
+		// Only a value already at the last-digit boundary can overflow:
+		// for n < MaxInt/10, n*10+9 < MaxInt. So the exact check runs once
+		// per header at most, and never on the common path.
+		if n >= math.MaxInt/10 && n > (math.MaxInt-d)/10 {
+			return 0, false
+		}
+		n = n*10 + d
+	}
+	return n, true
+}
+
+// readGrowing reads exactly need bytes into data, growing it only after the
+// current capacity is full so capacity stays tied to the bytes that actually
+// arrived rather than to an untrusted declared length. It is the cold path:
+// readLoad handles records that fit the reusable buffer inline.
+func readGrowing(r io.Reader, data []byte, need int) ([]byte, error) {
+	for len(data) < need {
+		if len(data) == cap(data) {
+			// Grow only after the current buffer is full, so capacity stays
+			// within max(minLoadGrowth, 16x the bytes actually read) whatever
+			// the header claimed. The large factor keeps copies rare: a 1 MiB
+			// record needs two grows, not five. Request no more than remains;
+			// slices.Grow may round up the capacity.
+			grow := minLoadGrowth
+			if cap(data) > minLoadGrowth/15 && cap(data) < math.MaxInt/15 {
+				grow = cap(data) * 15
+			}
+			if grow > need-len(data) {
+				grow = need - len(data)
+			}
+			data = slices.Grow(data, grow)
+		}
+		// Fill the capacity already on hand in one read.
+		want := cap(data) - len(data)
+		if want > need-len(data) {
+			want = need - len(data)
+		}
+		base := len(data)
+		data = data[:base+want]
+		if _, err := io.ReadFull(r, data[base:]); err != nil {
+			return data, err
+		}
+	}
+	return data, nil
 }
 
 // readLoad reads from the reader and loads commands into the database.
@@ -867,9 +910,9 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		cmdByteSize += int64(len(line))
 
 		// convert the string number to and int
-		count, err := parseRESPLen(line)
-		if err != nil {
-			return totalSize, err
+		count, ok := parseRESPLen(line)
+		if !ok {
+			return totalSize, ErrInvalid
 		}
 		// read each part of the command.
 		parts = parts[:0]
@@ -884,9 +927,9 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			}
 			cmdByteSize += int64(len(line))
 			// convert the string number to and int
-			size, err := parseRESPLen(line)
-			if err != nil {
-				return totalSize, err
+			size, ok := parseRESPLen(line)
+			if !ok {
+				return totalSize, ErrInvalid
 			}
 			if size > math.MaxInt-2 {
 				return totalSize, ErrInvalid
@@ -897,31 +940,14 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			// that much. data is reused across commands, so a file of large
 			// records stops reallocating after the first one.
 			need := size + 2
-			data = data[:0]
-			for len(data) < need {
-				if len(data) == cap(data) {
-					// Grow geometrically with a fixed minimum increment, only
-					// after filling the current buffer. Request no more than
-					// remains; slices.Grow may round up the capacity.
-					grow := minLoadGrowth
-					if cap(data) > minLoadGrowth/3 && cap(data) < math.MaxInt/3 {
-						grow = cap(data) * 3
-					}
-					if grow > need-len(data) {
-						grow = need - len(data)
-					}
-					data = slices.Grow(data, grow)
-				}
-				// Fill the capacity already on hand in one read.
-				want := cap(data) - len(data)
-				if want > need-len(data) {
-					want = need - len(data)
-				}
-				base := len(data)
-				data = data[:base+want]
-				if _, err = io.ReadFull(r, data[base:]); err != nil {
+			if need <= cap(data) {
+				// The reusable buffer already fits: one read, as upstream did.
+				data = data[:need]
+				if _, err = io.ReadFull(r, data); err != nil {
 					return totalSize, err
 				}
+			} else if data, err = readGrowing(r, data[:0], need); err != nil {
+				return totalSize, err
 			}
 			if data[size] != '\r' || data[size+1] != '\n' {
 				return totalSize, ErrInvalid
