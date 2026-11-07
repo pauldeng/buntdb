@@ -12,7 +12,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
-	"runtime"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -189,15 +189,12 @@ func (db *DB) Close() error {
 	if db.closed {
 		return ErrDatabaseClosed
 	}
-	db.closed = true
 	var err error
 	if db.persist {
 		err = db.file.Sync()
 		err = errors.Join(err, db.file.Close())
 	}
-	// Let's release all references to nil. This will help both with debugging
-	// late usage panics and it provides a hint to the garbage collector
-	db.keys, db.exps, db.idxs, db.file = nil, nil, nil, nil
+	db.abandon()
 	return err
 }
 
@@ -666,6 +663,23 @@ func shrinkDue(pos, last int64, pct int) bool {
 
 // Shrink will make the database file smaller by removing redundant
 // log entries. This operation does not block the database.
+//
+// Shrink writes the new file to a temporary file in the same directory. It
+// syncs that file before it replaces the old one, so a crash leaves either
+// the old file or the new file, complete.
+//
+// The new file keeps the permission bits of the old file. On Unix it also
+// keeps the owner and group, and on Linux the POSIX ACL. If Shrink cannot copy
+// the owner or the ACL, the new file gets at most mode 0600 and no ACL. Shrink
+// does not report this narrowing. If Shrink cannot remove an inherited ACL, it
+// returns the error and leaves the database open on the old file.
+// On Windows the new file inherits its DACL from the directory.
+// Shrink does not copy an explicit DACL from the old file.
+//
+// If a failed Shrink leaves the database file unusable, Shrink closes the
+// database and returns the error. Later calls return ErrDatabaseClosed.
+// Shrink never panics for this reason. If only the final directory sync
+// fails, the database stays open and uses the new file.
 func (db *DB) Shrink() error {
 	db.mu.Lock()
 	if db.closed {
@@ -690,25 +704,26 @@ func (db *DB) Shrink() error {
 		db.mu.Unlock()
 	}()
 	fname := db.file.Name()
-	tmpname := fname + ".tmp"
 	// the endpos is used to return to the end of the file when we are
 	// finished writing all of the current items.
-	endpos, err := db.file.Seek(0, 2)
-	if err != nil {
-		// Still holding db.mu here, and the deferred cleanup above re-acquires
-		// it. Returning without unlocking deadlocks against ourselves.
-		db.mu.Unlock()
-		return err
-	}
+	endpos, err := db.file.Seek(0, io.SeekEnd)
 	db.mu.Unlock()
-	time.Sleep(time.Second / 4) // wait just a bit before starting
-	f, err := os.Create(tmpname)
 	if err != nil {
 		return err
 	}
+	time.Sleep(time.Second / 4) // wait just a bit before starting
+	// The temp file is new and private (mode 0600). It is in the database
+	// directory so that the final rename stays on one file system.
+	f, err := os.CreateTemp(filepath.Dir(fname), filepath.Base(fname)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpname := f.Name()
 	defer func() {
 		_ = f.Close()
-		_ = os.RemoveAll(tmpname)
+		if tmpname != "" { // empty once renamed over the database file
+			_ = os.Remove(tmpname)
+		}
 	}()
 
 	// we are going to read items in as chunks as to not hold up the database
@@ -778,47 +793,99 @@ func (db *DB) Shrink() error {
 		if _, err := io.Copy(f, aof); err != nil {
 			return err
 		}
-		// Close all files
+		// Windows cannot replace a file that another handle has open.
 		if err := aof.Close(); err != nil {
+			return err
+		}
+		fi, err := db.file.Stat()
+		if err != nil {
+			return err
+		}
+		if err := copyPermissions(f, db.file, fi); err != nil {
+			return err
+		}
+		// The data must be on disk before the rename. Until the rename
+		// succeeds, the old file is intact and the database stays usable.
+		if err := f.Sync(); err != nil {
 			return err
 		}
 		if err := f.Close(); err != nil {
 			return err
 		}
+		// From here on db.file is unusable. Each failure either reopens a
+		// file at the end, or closes the database.
 		if err := db.file.Close(); err != nil {
-			return err
+			return db.reopenOrAbandon(fname, err)
 		}
-		// Any failures below here are really bad. So just panic.
-		if err := renameFile(tmpname, fname); err != nil {
-			panicErr(err)
+		if err := os.Rename(tmpname, fname); err != nil {
+			return db.reopenOrAbandon(fname, err)
 		}
-		db.file, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+		tmpname = ""
+		pos, err := db.reopen(fname)
 		if err != nil {
-			panicErr(err)
-		}
-		pos, err := db.file.Seek(0, 2)
-		if err != nil {
+			db.abandon()
 			return err
 		}
 		db.lastaofsz = pos
-		return nil
+		// The rename is durable only after the directory is synced. The
+		// database is already using the new file, so it stays open.
+		return syncDir(filepath.Dir(fname))
 	}()
+}
+
+// reopen opens path for appending, positions it at the end, and makes it
+// db.file. It returns the position. db.mu must be held.
+func (db *DB) reopen(path string) (int64, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0) // no O_CREATE: the file must exist
+	if err != nil {
+		return 0, err
+	}
+	pos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		_ = f.Close() // a file with no known position must not be written to
+		return 0, err
+	}
+	db.file = f
+	return pos, nil
+}
+
+// reopenOrAbandon reopens the unchanged database file after cause. If that
+// fails too, it closes the database. It returns cause, joined with any reopen
+// error. db.mu must be held.
+func (db *DB) reopenOrAbandon(path string, cause error) error {
+	if _, err := db.reopen(path); err != nil {
+		db.abandon()
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+// abandon closes the database without a file to close, because the file is
+// already closed or was never reopened. db.mu must be held.
+func (db *DB) abandon() {
+	db.closed = true
+	db.keys, db.exps, db.idxs, db.file = nil, nil, nil, nil
+}
+
+// copyPermissions gives the new file dst the permission bits of src, where fi
+// describes src. It copies the owner, group and ACL first, so that no one
+// gains access that src did not grant. dst starts with mode 0600. When it
+// cannot copy the owner or the ACL, it removes any ACL that dst inherited from
+// its directory, and dst keeps fi's mode&0600. When it cannot remove the ACL,
+// it returns the error: dst may carry an ACL that src does not have.
+func copyPermissions(dst, src *os.File, fi os.FileInfo) error {
+	perm := fi.Mode().Perm()
+	if copyOwner(dst, fi) && copyACL(dst, src) == nil {
+		return dst.Chmod(perm)
+	}
+	if err := removeACL(dst); err != nil {
+		return err
+	}
+	return dst.Chmod(perm & 0600)
 }
 
 func panicErr(err error) {
 	panic(fmt.Errorf("buntdb: %w", err))
-}
-
-func renameFile(src, dest string) error {
-	var err error
-	if err = os.Rename(src, dest); err != nil {
-		if runtime.GOOS == "windows" {
-			if err = os.Remove(dest); err == nil {
-				err = os.Rename(src, dest)
-			}
-		}
-	}
-	return err
 }
 
 // minLoadGrowth is the smallest step the load buffer grows by once its current

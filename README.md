@@ -566,6 +566,26 @@ There's a background routine that automatically shrinks the log file when it get
 There is also a `Shrink()` function which will rewrite the aof file so that it contains only the items in the database.
 The shrink operation does not lock up the database so read and write transactions can continue while shrinking is in process.
 
+`Shrink` writes the new file to a temporary file in the database directory and syncs it before the rename.
+After a crash, the database file is either the old file or the new file, complete.
+The temporary file starts at mode `0600`.
+
+**Behavior change.** `Shrink` no longer panics when the rename, the reopen or the seek fails.
+If it cannot keep a usable database file, it closes the database and returns the error.
+Later calls return `ErrDatabaseClosed`.
+If only the final directory sync fails, the database stays open and uses the new file.
+
+The new file keeps the permission bits of the old file.
+On Unix it also keeps the owner and group, and on Linux the POSIX ACL.
+If `Shrink` cannot copy the owner or the ACL, the new file gets at most mode `0600` and no ACL.
+`Shrink` does not report this narrowing.
+If it cannot remove an inherited ACL, it returns the error and the database stays open on the old file.
+Earlier versions gave the new file mode `0666` minus the umask, and the default ACL of the directory.
+
+**Windows.** Unix mode bits do not restrict a Windows DACL.
+The new file inherits its DACL from the directory, like a file that `Open` creates there.
+`Shrink` does not copy an explicit DACL from the old file.
+
 ### Durability and fsync
 
 By default BuntDB executes an `fsync` once every second on the [aof file](#append-only-file). Which simply means that there's a chance that up to one second of data might be lost. If you need higher durability then there's an optional database config setting `Config.SyncPolicy` which can be set to `Always`.

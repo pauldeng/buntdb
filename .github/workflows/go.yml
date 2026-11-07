@@ -21,8 +21,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux plus Windows is the selected coverage scope. renameFile is the
-        # only runtime.GOOS branch in the package, and it is Windows-specific.
+        # Linux plus Windows is the selected coverage scope. The Linux job
+        # also runs the strace and POSIX ACL tests.
         os: [ubuntu-latest, windows-latest]
 
     steps:
@@ -46,12 +46,12 @@ jobs:
     - name: Vet
       run: go vet .
 
-    - name: Install sync fault-injection tool
+    - name: Install Linux test tools (strace, setfacl)
       if: runner.os == 'Linux'
       run: |
-        if ! command -v strace >/dev/null; then
+        if ! command -v strace >/dev/null || ! command -v setfacl >/dev/null; then
           sudo apt-get update
-          sudo apt-get install -y strace
+          sudo apt-get install -y strace acl
         fi
 
     - name: Test

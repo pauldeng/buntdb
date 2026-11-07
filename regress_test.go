@@ -832,6 +832,38 @@ func Benchmark_Load_LargeValues(b *testing.B) {
 	benchmarkLoad(b, corpus)
 }
 
+// Benchmark_Shrink measures one Shrink of a 100k-key database. Shrink waits
+// 250 ms before it starts, which is part of ns/op. The work-ns/op metric
+// leaves that wait out.
+func Benchmark_Shrink(b *testing.B) {
+	db, err := Open(filepath.Join(b.TempDir(), "data.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SetConfig(Config{SyncPolicy: Never, AutoShrinkDisabled: true}); err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for i := range 100000 {
+			if _, _, err := tx.Set(fmt.Sprintf("user:%08d", i), fmt.Sprintf("value-%08d", i), nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	start := time.Now()
+	for b.Loop() {
+		if err := db.Shrink(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(time.Since(start)-time.Duration(b.N)*time.Second/4)/float64(b.N), "work-ns/op")
+}
+
 // A5: Shrink takes db.mu, sets db.shrinking, and registers a deferred cleanup
 // that re-acquires db.mu. If the initial Seek failed, the function returned
 // while still holding the lock, so that cleanup deadlocked against itself.
