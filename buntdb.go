@@ -64,8 +64,6 @@ var (
 	ErrTxIterating = errors.New("tx is iterating")
 )
 
-const useAbsEx = true
-
 // DB represents a collection of key-value pairs that persist on disk.
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
@@ -209,11 +207,10 @@ func (db *DB) Save(wr io.Writer) error {
 	defer db.mu.RUnlock()
 	// use a buffered writer and flush every 4MB
 	var buf []byte
-	now := time.Now()
 	// iterated through every item in the database and write to the buffer
 	btreeAscend(db.keys, func(item interface{}) bool {
 		dbi := item.(*dbItem)
-		buf = dbi.writeSetTo(buf, now)
+		buf = dbi.writeSetTo(buf)
 		if len(buf) > 1024*1024*4 {
 			// flush when buffer is over 4MB
 			_, err = wr.Write(buf)
@@ -696,7 +693,6 @@ func (db *DB) Shrink() error {
 			}
 			done = true
 			var n int
-			now := time.Now()
 			btreeAscendGreaterOrEqual(db.keys, &dbItem{key: pivot},
 				func(item interface{}) bool {
 					dbi := item.(*dbItem)
@@ -706,7 +702,7 @@ func (db *DB) Shrink() error {
 						done = false
 						return false
 					}
-					buf = dbi.writeSetTo(buf, now)
+					buf = dbi.writeSetTo(buf)
 					n++
 					return true
 				},
@@ -865,8 +861,8 @@ func readGrowing(r io.Reader, data []byte, need int) ([]byte, error) {
 }
 
 // readLoad reads from the reader and loads commands into the database.
-// modTime is the modified time of the reader, should be no greater than
-// the current time.Now().
+// modTime is the modified time of the reader. A modTime after time.Now() is
+// treated as time.Now(), so a legacy "ex" TTL never grows from a future mtime.
 // Returns the offset just past the last complete command, and the error if any.
 // NUL padding counts when a complete command follows it. A "*0" command counts.
 // Trailing NULs do not count, so the caller may truncate the file to n.
@@ -985,14 +981,25 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 					return totalSize, ErrInvalid
 				}
 				ex, err := strconv.ParseInt(parts[4], 10, 64)
+				if errors.Is(err, strconv.ErrRange) && arg == "ae" {
+					// An older writer stored a pre-1970 time as a uint64.
+					// Wrapping it back to int64 recovers the signed value.
+					if u, uerr := strconv.ParseUint(parts[4], 10, 64); uerr == nil {
+						ex, err = int64(u), nil
+					}
+				}
 				if err != nil {
-					return totalSize, err
+					return totalSize, ErrInvalid
+				}
+				// time.Unix wraps a larger "ae" to a past time. Smaller values
+				// cannot wrap, and are only ever expired.
+				if arg == "ae" && ex > maxTime.Unix() {
+					return totalSize, ErrInvalid
 				}
 				var exat time.Time
 				now := time.Now()
 				if arg == "ex" {
-					dur := (time.Duration(ex) * time.Second) - now.Sub(modTime)
-					exat = now.Add(dur)
+					exat = legacyExpiry(ex, modTime, now)
 				} else {
 					exat = time.Unix(ex, 0)
 				}
@@ -1032,6 +1039,28 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		totalSize += pending + cmdByteSize
 		pending = 0
 	}
+}
+
+// legacyExpiry returns the deadline of a legacy relative "ex" TTL of ex seconds
+// in a file last modified at modTime. A deadline that is not after now means
+// the item has expired. The arithmetic saturates, so it cannot wrap.
+func legacyExpiry(ex int64, modTime, now time.Time) time.Time {
+	// A modTime in the future would make the age negative and the sum overflow.
+	age := time.Duration(0)
+	if modTime.Before(now) {
+		age = now.Sub(modTime) // saturates at the largest Duration
+	}
+	if ex > math.MaxInt64/int64(time.Second) {
+		return maxTime // the TTL is longer than any Duration: never expires
+	}
+	if ex < math.MinInt64/int64(time.Second) {
+		return now // the TTL is longer than any Duration: long expired
+	}
+	d := time.Duration(ex) * time.Second
+	if d < math.MinInt64+age {
+		return now // d - age would underflow: long expired
+	}
+	return now.Add(d - age)
 }
 
 // load reads entries from the append only database file and fills the database.
@@ -1310,13 +1339,12 @@ func (tx *Tx) Commit() error {
 		if tx.wc.rbkeys != nil {
 			tx.db.buf = append(tx.db.buf, "*1\r\n$7\r\nflushdb\r\n"...)
 		}
-		now := time.Now()
 		// Each committed record is written to disk
 		for key, item := range tx.wc.commitItems {
 			if item == nil {
 				tx.db.buf = (&dbItem{key: key}).writeDeleteTo(tx.db.buf)
 			} else {
-				tx.db.buf = item.writeSetTo(tx.db.buf, now)
+				tx.db.buf = item.writeSetTo(tx.db.buf)
 			}
 		}
 		// Flushing the buffer only once per transaction.
@@ -1453,22 +1481,27 @@ func appendBulkString(buf []byte, s string) []byte {
 	return buf
 }
 
-// writeSetTo writes an item as a single SET record to the a bufio Writer.
-func (dbi *dbItem) writeSetTo(buf []byte, now time.Time) []byte {
+// appendBulkInt appends n as a bulk string. It allocates only if buf lacks capacity.
+func appendBulkInt(buf []byte, n int64) []byte {
+	var digits [20]byte // fits the longest int64, "-9223372036854775808"
+	num := strconv.AppendInt(digits[:0], n, 10)
+	buf = append(buf, '$')
+	buf = strconv.AppendInt(buf, int64(len(num)), 10)
+	buf = append(buf, '\r', '\n')
+	buf = append(buf, num...)
+	buf = append(buf, '\r', '\n')
+	return buf
+}
+
+// writeSetTo appends the item as a single SET record to buf and returns it.
+func (dbi *dbItem) writeSetTo(buf []byte) []byte {
 	if dbi.opts != nil && dbi.opts.ex {
 		buf = appendArray(buf, 5)
 		buf = appendBulkString(buf, "set")
 		buf = appendBulkString(buf, dbi.key)
 		buf = appendBulkString(buf, dbi.val)
-		if useAbsEx {
-			ex := dbi.opts.exat.Unix()
-			buf = appendBulkString(buf, "ae")
-			buf = appendBulkString(buf, strconv.FormatUint(uint64(ex), 10))
-		} else {
-			ex := dbi.opts.exat.Sub(now) / time.Second
-			buf = appendBulkString(buf, "ex")
-			buf = appendBulkString(buf, strconv.FormatUint(uint64(ex), 10))
-		}
+		buf = appendBulkString(buf, "ae")
+		buf = appendBulkInt(buf, dbi.opts.exat.Unix())
 	} else {
 		buf = appendArray(buf, 3)
 		buf = appendBulkString(buf, "set")
@@ -1478,7 +1511,7 @@ func (dbi *dbItem) writeSetTo(buf []byte, now time.Time) []byte {
 	return buf
 }
 
-// writeSetTo writes an item as a single DEL record to the a bufio Writer.
+// writeDeleteTo appends the item's key as a single DEL record to buf and returns it.
 func (dbi *dbItem) writeDeleteTo(buf []byte) []byte {
 	buf = appendArray(buf, 2)
 	buf = appendBulkString(buf, "del")

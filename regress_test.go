@@ -195,8 +195,8 @@ func newLoadTarget() *DB {
 
 // appendSet encodes one valid SET record using the production writer, so a
 // corpus built here is exactly what buntdb itself would have written.
-func appendSet(buf []byte, key, val string, now time.Time) []byte {
-	return (&dbItem{key: key, val: val}).writeSetTo(buf, now)
+func appendSet(buf []byte, key, val string) []byte {
+	return (&dbItem{key: key, val: val}).writeSetTo(buf)
 }
 
 // A truncated final command is explicitly allowed: load() truncates the file to
@@ -206,16 +206,15 @@ func appendSet(buf []byte, key, val string, now time.Time) []byte {
 func TestControlIncompleteTailRecovery(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.db")
-	now := time.Now()
 
 	var buf []byte
 	for i := range 3 {
-		buf = appendSet(buf, fmt.Sprintf("key:%d", i), fmt.Sprintf("val:%d", i), now)
+		buf = appendSet(buf, fmt.Sprintf("key:%d", i), fmt.Sprintf("val:%d", i))
 	}
 	validLen := len(buf)
 
 	// Append a command cut in half.
-	partial := appendSet(nil, "partial", "should-not-load", now)
+	partial := appendSet(nil, "partial", "should-not-load")
 	buf = append(buf, partial[:len(partial)/2]...)
 
 	if err := os.WriteFile(path, buf, 0666); err != nil {
@@ -338,17 +337,17 @@ func TestControlLargeRecordRoundTrip(t *testing.T) {
 func TestControlExpiryRoundTrip(t *testing.T) {
 	now := time.Now()
 	var buf []byte
-	buf = appendSet(buf, "plain", "value", now)
+	buf = appendSet(buf, "plain", "value")
 	buf = (&dbItem{
 		key:  "living",
 		val:  "value",
 		opts: &dbItemOpts{ex: true, exat: now.Add(time.Hour)},
-	}).writeSetTo(buf, now)
+	}).writeSetTo(buf)
 	buf = (&dbItem{
 		key:  "dead",
 		val:  "value",
 		opts: &dbItemOpts{ex: true, exat: now.Add(-time.Hour)},
-	}).writeSetTo(buf, now)
+	}).writeSetTo(buf)
 
 	db := newLoadTarget()
 	if _, err := db.readLoad(bytes.NewReader(buf), now); err != nil {
@@ -498,7 +497,7 @@ func TestRegressAllocationBoundedByBytesRead(t *testing.T) {
 	// A 16 MiB declaration still detects eager allocation, but limits even the
 	// old parser to 32 MiB rather than risking a 2 GiB allocation in the suite.
 	tail := "*3\r\n$3\r\nset\r\n$16777216\r\nx\r\n"
-	prefix := string(appendSet(nil, "kept", "value", time.Now()))
+	prefix := string(appendSet(nil, "kept", "value"))
 	aof := prefix + tail
 	memory, err := Open(":memory:")
 	if err != nil {
@@ -571,8 +570,7 @@ func TestRegressAllocationBoundedByBytesRead(t *testing.T) {
 // out of the offset it returned. Open seeks to that offset, so the next commit
 // overwrote the end of the preceding record.
 func TestRegressLoadOffsetCountsSkippedBytes(t *testing.T) {
-	now := time.Now()
-	set := func(k, v string) string { return string(appendSet(nil, k, v, now)) }
+	set := func(k, v string) string { return string(appendSet(nil, k, v)) }
 	for _, tc := range []struct {
 		name, content string
 		want          map[string]string
@@ -618,7 +616,7 @@ func TestRegressLoadOffsetCountsSkippedBytes(t *testing.T) {
 // preceded it, so the record was lost on the next open.
 func TestRegressNULThenTruncatedTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.db")
-	valid := string(appendSet(nil, "k", "v", time.Now()))
+	valid := string(appendSet(nil, "k", "v"))
 	if err := os.WriteFile(path, []byte("\x00"+valid+"*3\r\n$1\r\nS\r\n$1"), 0666); err != nil {
 		t.Fatal(err)
 	}
@@ -664,7 +662,7 @@ func dbContents(t *testing.T, db *DB) map[string]string {
 
 // The offset is where the caller truncates, so trailing NULs must not count.
 func TestControlLoadOffsetExcludesTrailingNULs(t *testing.T) {
-	cmd := string(appendSet(nil, "k", "v", time.Now()))
+	cmd := string(appendSet(nil, "k", "v"))
 	for _, tc := range []struct {
 		name, in string
 		want     int
@@ -815,22 +813,20 @@ func benchmarkLoad(b *testing.B, corpus []byte) {
 }
 
 func Benchmark_Load_SmallRecords(b *testing.B) {
-	now := time.Now()
 	var corpus []byte
 	for i := range 20000 {
 		corpus = appendSet(corpus,
 			fmt.Sprintf("user:%012d", i),
-			fmt.Sprintf("value-%012d", i), now)
+			fmt.Sprintf("value-%012d", i))
 	}
 	benchmarkLoad(b, corpus)
 }
 
 func Benchmark_Load_LargeValues(b *testing.B) {
-	now := time.Now()
 	large := strings.Repeat("x", 1<<20) // 1 MiB
 	var corpus []byte
 	for i := range 8 {
-		corpus = appendSet(corpus, fmt.Sprintf("big:%d", i), large, now)
+		corpus = appendSet(corpus, fmt.Sprintf("big:%d", i), large)
 	}
 	benchmarkLoad(b, corpus)
 }
@@ -986,6 +982,251 @@ func TestRegressAbnormalExitDoesNotCommit(t *testing.T) {
 			}
 			if _, err := aborted.Get("during"); err != ErrTxClosed {
 				t.Errorf("aborted transaction Get = %v, want ErrTxClosed", err)
+			}
+		})
+	}
+}
+
+// setExRecord encodes a five-part SET of key "k" with a raw expiry argument
+// (arg is "ae" or "ex"). It bypasses the writer so a test can feed the loader
+// numbers that the writer would never produce.
+func setExRecord(arg, num string) []byte {
+	return []byte("*5\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\n" + arg +
+		"\r\n$" + strconv.Itoa(len(num)) + "\r\n" + num + "\r\n")
+}
+
+// C3: a pre-1970 absolute expiry was written as a uint64, which the reader's
+// ParseInt rejects as out of range, so the database could not reopen.
+func TestRegressPre1970ExpiryReopens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() // a second Close after the explicit one is harmless
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("live", "1", nil); err != nil {
+			return err
+		}
+		_, _, err := tx.Set("old", "2", &SetOptions{Expires: true, TTL: -100 * 365 * 24 * time.Hour})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		raw, _ := os.ReadFile(path)
+		t.Fatalf("reopen: %v; file=%q", err, raw)
+	}
+	defer db.Close()
+	if got, want := dbContents(t, db), map[string]string{"live": "1"}; !maps.Equal(got, want) {
+		t.Errorf("after reopen got %v, want %v", got, want)
+	}
+}
+
+// The loader accepts a wrapped uint64 for "ae" only, to read files that the
+// old writer produced. Every other bad number is ErrInvalid, as is an "ae"
+// that time.Unix cannot represent. An accepted expiry replaces an earlier "k".
+func TestRegressLoadExpiryNumbers(t *testing.T) {
+	maxAe := strconv.FormatInt(maxTime.Unix(), 10)
+	for _, tc := range []struct {
+		name, arg, num string
+		wantErr        error
+		live           bool // k keeps the new value instead of being deleted
+	}{
+		{"signed pre-1970", "ae", "-31536000", nil, false},
+		{"most negative ae", "ae", "-9223372036854775808", nil, false},
+		{"old writer, wrapped uint64", "ae", "18446744073678015616", nil, false},
+		{"old writer, max uint64", "ae", "18446744073709551615", nil, false},
+		{"ae at maxTime", "ae", maxAe, nil, true},
+		{"ae above maxTime", "ae", "9223371974719179008", ErrInvalid, false},
+		{"ae max int64", "ae", "9223372036854775807", ErrInvalid, false},
+		{"ae above uint64", "ae", "18446744073709551616", ErrInvalid, false},
+		{"ae below int64", "ae", "-9223372036854775809", ErrInvalid, false},
+		{"ae not a number", "ae", "abc", ErrInvalid, false},
+		{"ae empty", "ae", "", ErrInvalid, false},
+		{"ex wrapped uint64", "ex", "18446744073678015616", ErrInvalid, false},
+		{"ex above int64", "ex", "9223372036854775808", ErrInvalid, false},
+		{"ex not a number", "ex", "1e3", ErrInvalid, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := appendSet(nil, "k", "previous")
+			rec = appendSet(rec, "other", "o")
+			rec = append(rec, setExRecord(tc.arg, tc.num)...)
+			db := newLoadTarget()
+			_, err := db.readLoad(bytes.NewReader(rec), time.Now())
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("readLoad err = %v, want %v", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			want := []string{"other"}
+			if tc.live {
+				want = []string{"k", "other"}
+			}
+			if got := loadedKeys(db); !slices.Equal(got, want) {
+				t.Fatalf("loaded keys %v, want %v", got, want)
+			}
+			if k := db.get("k"); tc.live && (k == nil || k.val != "v") {
+				t.Errorf("k = %+v, want the new value %q", k, "v")
+			}
+		})
+	}
+}
+
+// The post-1970 bytes must never change: files written by older versions and
+// by this one have to stay readable by each other. A pre-1970 expiry is the
+// one deliberate difference, written as a signed number.
+func TestControlWriterGoldenBytes(t *testing.T) {
+	const set = "*5\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nae\r\n"
+	withEx := func(exat time.Time) *dbItem {
+		return &dbItem{key: "k", val: "v", opts: &dbItemOpts{ex: true, exat: exat}}
+	}
+	for _, tc := range []struct {
+		name string
+		item *dbItem
+		want string
+	}{
+		{"plain set", &dbItem{key: "k", val: "v"}, "*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n"},
+		{"post-1970 expiry", withEx(time.Unix(1700000000, 123)), set + "$10\r\n1700000000\r\n"},
+		{"epoch expiry", withEx(time.Unix(0, 0)), set + "$1\r\n0\r\n"},
+		{"pre-1970 expiry", withEx(time.Unix(-31536000, 0)), set + "$9\r\n-31536000\r\n"},
+		{"year 1 expiry", withEx(time.Time{}), set + "$12\r\n-62135596800\r\n"},
+		{"most negative expiry", withEx(time.Unix(math.MinInt64, 0)), set + "$20\r\n-9223372036854775808\r\n"},
+		{"maxTime expiry", withEx(maxTime), set + "$19\r\n9223371974719179007\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(tc.item.writeSetTo(nil)); got != tc.want {
+				t.Errorf("writeSetTo = %q, want %q", got, tc.want)
+			}
+			// The writer must not allocate once the buffer has room.
+			buf := make([]byte, 0, 256)
+			if n := testing.AllocsPerRun(100, func() { buf = tc.item.writeSetTo(buf[:0]) }); n != 0 {
+				t.Errorf("writeSetTo allocates %v times per call, want 0", n)
+			}
+		})
+	}
+	const del = "*2\r\n$3\r\ndel\r\n$1\r\nk\r\n"
+	if got := string((&dbItem{key: "k"}).writeDeleteTo(nil)); got != del {
+		t.Errorf("writeDeleteTo = %q, want %q", got, del)
+	}
+}
+
+// C12: a legacy relative "ex" TTL overflowed time.Duration arithmetic, so a
+// hugely expired record loaded as live and a long TTL on a future-dated file
+// loaded as expired. The mtime is set by Chtimes, so it needs no sleeping.
+func TestRegressLegacyExFile(t *testing.T) {
+	const maxEx = math.MaxInt64 / int64(time.Second) // 9223372036: the largest ex that fits
+	for _, tc := range []struct {
+		name string
+		ex   int64
+		age  time.Duration // negative: the file is dated in the future
+		live bool
+	}{
+		{"fresh file", 3600, 0, true},
+		{"one second old", 3600, time.Second, true},
+		{"future-dated file", 3600, -2 * time.Second, true},
+		{"future-dated, far-future ex", maxEx, -2 * time.Second, true},
+		{"one second old, far-future ex", maxEx, time.Second, true},
+		{"fresh, negative ex at limit", -maxEx, 0, false},
+		{"one second old, negative ex at limit", -maxEx, time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "x.db")
+			if err := os.WriteFile(path, setExRecord("ex", strconv.FormatInt(tc.ex, 10)), 0666); err != nil {
+				t.Fatal(err)
+			}
+			mtime := time.Now().Add(-tc.age)
+			if err := os.Chtimes(path, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+			fi, err := os.Stat(path) // the file system may round the time
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := fi.ModTime()
+			t0 := time.Now()
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.View(func(tx *Tx) error {
+				ttl, err := tx.TTL("k")
+				t1 := time.Now()
+				if !tc.live {
+					if err != ErrNotFound {
+						t.Errorf("TTL = (%v, %v), want ErrNotFound", ttl, err)
+					}
+					return nil
+				}
+				if err != nil {
+					t.Errorf("TTL err = %v, want a live item", err)
+					return nil
+				}
+				// The deadline is m+ex for an old file and Open's time plus ex for
+				// a future-dated one, which counts as age 0. Time passes between
+				// t0, Open, and t1, so the observed times bound the result. This
+				// holds even if a pause makes a future-dated file old by Open.
+				d := time.Duration(tc.ex) * time.Second
+				hi := d - max(0, t0.Sub(m))
+				lo := hi - t1.Sub(t0)
+				const skew = time.Millisecond // wall clock against monotonic clock
+				if ttl > hi+skew || ttl < lo-skew {
+					t.Errorf("TTL = %v, want in [%v, %v]", ttl, lo-skew, hi+skew)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// The boundaries of the legacy "ex" arithmetic, tested without file timing.
+func TestRegressLegacyExpiryBoundaries(t *testing.T) {
+	const maxEx = math.MaxInt64 / int64(time.Second) // 9223372036
+	now := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		ex      int64
+		modTime time.Time
+		want    time.Time // the zero value means "expired", maxTime means "never"
+	}{
+		{"fresh", 10, now, now.Add(10 * time.Second)},
+		{"keeps nanoseconds", 10, now.Add(-1500 * time.Millisecond), now.Add(8500 * time.Millisecond)},
+		{"zero ex, fresh", 0, now, time.Time{}},
+		{"zero ex, old", 0, now.Add(-time.Second), time.Time{}},
+		{"older than ex", 10, now.Add(-11 * time.Second), time.Time{}},
+		{"future file counts as fresh", 10, now.Add(2 * time.Second), now.Add(10 * time.Second)},
+		{"far-future file counts as fresh", 10, now.AddDate(300, 0, 0), now.Add(10 * time.Second)},
+		{"max ex, fresh", maxEx, now, now.Add(time.Duration(maxEx) * time.Second)},
+		{"max ex, 1 s old", maxEx, now.Add(-time.Second), now.Add(time.Duration(maxEx)*time.Second - time.Second)},
+		{"max ex, future file", maxEx, now.Add(2 * time.Second), now.Add(time.Duration(maxEx) * time.Second)},
+		{"max ex, zero-time file", maxEx, time.Time{}, time.Time{}},
+		{"max ex + 1", maxEx + 1, now, maxTime},
+		{"max ex + 1, old file", maxEx + 1, now.Add(-time.Hour), maxTime},
+		{"MaxInt64", math.MaxInt64, now, maxTime},
+		{"min ex, fresh", -maxEx, now, time.Time{}},
+		{"min ex, 1 s old", -maxEx, now.Add(-time.Second), time.Time{}},
+		{"min ex, future file", -maxEx, now.Add(2 * time.Second), time.Time{}},
+		{"min ex - 1", -maxEx - 1, now, time.Time{}},
+		{"MinInt64", math.MinInt64, now, time.Time{}},
+		{"zero-time file, ex 1", 1, time.Time{}, time.Time{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := legacyExpiry(tc.ex, tc.modTime, now)
+			switch {
+			case tc.want.IsZero():
+				if got.After(now) {
+					t.Errorf("legacyExpiry = %v, want expired (not after %v)", got, now)
+				}
+			case !got.Equal(tc.want):
+				t.Errorf("legacyExpiry = %v, want %v", got, tc.want)
 			}
 		})
 	}
