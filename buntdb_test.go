@@ -2694,8 +2694,13 @@ func TestOnExpiredSync(t *testing.T) {
 		t.Fail()
 	}
 
+	// The poller only records its first error. The test goroutine reports it
+	// after joining the poller, so no goroutine calls t.Fail after the test ends.
 	done := make(chan struct{})
+	polled := make(chan struct{})
+	var pollErr error
 	go func() {
+		defer close(polled)
 		ticks := time.NewTicker(time.Millisecond * 50)
 		defer ticks.Stop()
 		for {
@@ -2713,42 +2718,48 @@ func TestOnExpiredSync(t *testing.T) {
 						return err
 					}
 					if n < 0 || n > 2 {
-						t.Fail()
+						return fmt.Errorf("unexpected value %d", n)
 					}
 					return nil
 				})
 				if err != nil {
-					t.Fail()
+					pollErr = err
+					return
 				}
 			}
 		}
 	}()
+	// Runs before testClose: stop and join the poller, then report its error.
+	defer func() {
+		close(done)
+		<-polled
+		if pollErr != nil {
+			t.Error(pollErr)
+		}
+	}()
 
-OUTER1:
-	for {
+	// Wait for the callback to set the value to "2".
+	timeout := time.After(10 * time.Second)
+	for v := 0; v < 2; {
 		select {
-		case <-time.After(time.Second * 2):
-			t.Fail()
-		case v := <-hits:
-			if v >= 2 {
-				break OUTER1
-			}
+		case <-timeout:
+			t.Fatal("OnExpiredSync did not run twice")
+		case v = <-hits:
 		}
 	}
+	// The item expires 100 ms after the callback. Read it as expired-but-present.
 	err = db.View(func(tx *Tx) error {
-		defer close(done)
-		v, err := tx.Get("K")
+		v, err := tx.Get("K", true)
 		if err != nil {
-			t.Fail()
 			return err
 		}
 		if v != "2" {
-			t.Fail()
+			return fmt.Errorf("value %q, want \"2\"", v)
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fail()
+		t.Error(err)
 	}
 }
 

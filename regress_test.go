@@ -461,6 +461,38 @@ func TestRegressLengthBoundaries(t *testing.T) {
 	}
 }
 
+// Upstream issue #125: each crafted input must make Load return an error,
+// never panic, and never succeed silently.
+func TestRegressIssue125(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		aof  string
+	}{
+		{"1 one-byte SET name", "*3\r\n$1\r\nS\r\n$1\r\nk\r\n$1\r\nv\r\n"},
+		{"2 two-byte DEL name", "*2\r\n$2\r\nDE\r\n$1\r\nk\r\n"},
+		{"3 empty command name", "*1\r\n$0\r\n\r\n"},
+		{"4 part size 2^63", "*3\r\n$3\r\nset\r\n$9223372036854775808\r\n"},
+		{"5 command count 2^63", "*9223372036854775808\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n"},
+		{"5b count 2^63 alone", "*9223372036854775808\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Load panicked: %v", r)
+				}
+			}()
+			if err := db.Load(strings.NewReader(tc.aof)); err == nil {
+				t.Fatal("Load accepted malformed input")
+			}
+		})
+	}
+}
+
 // A2b: the read buffer was sized from the declared length before any of the
 // body arrived, so a tiny corrupt header could force a huge allocation. A
 // 29-byte file declaring 1 GiB allocated 2 GiB. Memory must instead be
