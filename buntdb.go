@@ -867,7 +867,9 @@ func readGrowing(r io.Reader, data []byte, need int) ([]byte, error) {
 // readLoad reads from the reader and loads commands into the database.
 // modTime is the modified time of the reader, should be no greater than
 // the current time.Now().
-// Returns the number of bytes of the last command read and the error if any.
+// Returns the offset just past the last complete command, and the error if any.
+// NUL padding counts when a complete command follows it. A "*0" command counts.
+// Trailing NULs do not count, so the caller may truncate the file to n.
 func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 	defer func() {
 		if err == io.EOF {
@@ -875,6 +877,7 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		}
 	}()
 	totalSize := int64(0)
+	pending := int64(0) // NUL bytes seen since the last complete command
 	data := make([]byte, 0, 4096)
 	parts := make([]string, 0, 8)
 	r := bufio.NewReader(rd)
@@ -889,8 +892,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			return totalSize, err
 		}
 		if c == 0 {
-			// ignore nul control characters
-			n += 1
+			// ignore nul control characters; count them once a command follows
+			pending++
 			continue
 		}
 		if err := r.UnreadByte(); err != nil {
@@ -959,6 +962,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		// finished reading the command
 
 		if len(parts) == 0 {
+			totalSize += pending + cmdByteSize
+			pending = 0
 			continue
 		}
 		// Each command is matched by exact length, then by byte. The length
@@ -1024,7 +1029,8 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		} else {
 			return totalSize, ErrInvalid
 		}
-		totalSize += cmdByteSize
+		totalSize += pending + cmdByteSize
+		pending = 0
 	}
 }
 

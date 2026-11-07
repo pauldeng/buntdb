@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -565,11 +567,175 @@ func TestRegressAllocationBoundedByBytesRead(t *testing.T) {
 	}
 }
 
+// C1/C2: readLoad left NUL bytes before a command, and the bytes of "*0\r\n",
+// out of the offset it returned. Open seeks to that offset, so the next commit
+// overwrote the end of the preceding record.
+func TestRegressLoadOffsetCountsSkippedBytes(t *testing.T) {
+	now := time.Now()
+	set := func(k, v string) string { return string(appendSet(nil, k, v, now)) }
+	for _, tc := range []struct {
+		name, content string
+		want          map[string]string
+	}{
+		{"nul between commands", set("a", "1") + "\x00\x00\x00\x00" + set("b", "2"),
+			map[string]string{"a": "1", "b": "2", "c": "3"}},
+		{"empty array", "*0\r\n" + set("b", "2"),
+			map[string]string{"b": "2", "c": "3"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "x.db")
+			if err := os.WriteFile(path, []byte(tc.content), 0666); err != nil {
+				t.Fatal(err)
+			}
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close() // a second Close after the explicit one is harmless
+			if err := db.Update(func(tx *Tx) error {
+				_, _, err := tx.Set("c", "3", nil)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err = Open(path)
+			if err != nil {
+				raw, _ := os.ReadFile(path)
+				t.Fatalf("reopen after append: %v; file=%q", err, raw)
+			}
+			defer db.Close()
+			if got := dbContents(t, db); !maps.Equal(got, tc.want) {
+				t.Fatalf("after reopen got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// C1: truncation recovery cut a valid record one byte short when NUL bytes
+// preceded it, so the record was lost on the next open.
+func TestRegressNULThenTruncatedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.db")
+	valid := string(appendSet(nil, "k", "v", time.Now()))
+	if err := os.WriteFile(path, []byte("\x00"+valid+"*3\r\n$1\r\nS\r\n$1"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() // a second Close after the explicit one is harmless
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "\x00"+valid {
+		t.Errorf("after recovery file=%q, want NUL+valid (len %d)", raw, 1+len(valid))
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	if got, want := dbContents(t, db), map[string]string{"k": "v"}; !maps.Equal(got, want) {
+		t.Errorf("after recovery got %v, want %v", got, want)
+	}
+}
+
+// dbContents returns every key and value in db.
+func dbContents(t *testing.T, db *DB) map[string]string {
+	t.Helper()
+	got := map[string]string{}
+	if err := db.View(func(tx *Tx) error {
+		return tx.Ascend("", func(k, v string) bool {
+			got[k] = v
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// The offset is where the caller truncates, so trailing NULs must not count.
+func TestControlLoadOffsetExcludesTrailingNULs(t *testing.T) {
+	cmd := string(appendSet(nil, "k", "v", time.Now()))
+	for _, tc := range []struct {
+		name, in string
+		want     int
+	}{
+		{"nul only", "\x00\x00\x00", 0},
+		{"command then nuls", cmd + "\x00\x00\x00", len(cmd)},
+		{"nul, command, nuls", "\x00" + cmd + "\x00\x00", 1 + len(cmd)},
+		{"empty array then nuls", "*0\r\n\x00", 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, err := newLoadTarget().readLoad(strings.NewReader(tc.in), time.Now())
+			if err != nil || n != int64(tc.want) {
+				t.Fatalf("readLoad = (%d, %v), want (%d, nil)", n, err, tc.want)
+			}
+		})
+	}
+}
+
+// loadedKeys lists the keys in db's b-tree, in order.
+func loadedKeys(db *DB) []string {
+	var keys []string
+	db.keys.Walk(func(items []interface{}) {
+		for _, v := range items {
+			keys = append(keys, v.(*dbItem).key)
+		}
+	})
+	return keys
+}
+
+// hasTTLSet reports whether b, a run of complete commands and NULs, holds a
+// five-part SET, the only command with a TTL. Skipping bulk bodies keeps their
+// bytes from reading as headers.
+func hasTTLSet(b []byte) bool {
+	// header consumes a "<c><digits>\r\n" line from the front of b.
+	header := func(c byte) (int, bool) {
+		end := bytes.Index(b, []byte("\r\n"))
+		if end < 0 || b[0] != c {
+			return 0, false
+		}
+		n, ok := parseRESPLen(b[:end+2])
+		b = b[end+2:]
+		return n, ok
+	}
+	for len(b) > 0 {
+		if b[0] == 0 {
+			b = b[1:]
+			continue
+		}
+		count, ok := header('*')
+		if !ok {
+			return false
+		}
+		for i := 0; i < count; i++ {
+			size, ok := header('$')
+			if !ok || len(b) < size+2 {
+				return false
+			}
+			if i == 0 && count == 5 && size == 3 && strings.EqualFold(string(b[:size]), "set") {
+				return true
+			}
+			b = b[size+2:]
+		}
+	}
+	return false
+}
+
 // FuzzReadLoad exercises the AOF parser against arbitrary input. readLoad is
 // reached from Open on any existing database file, so its inputs are untrusted
 // whenever a file is corrupt or hand-written.
 //
-// The oracle checks for panics and out-of-range recovery offsets. Allocation
+// The oracle checks for panics, recovery offsets and the NUL tail. Allocation
 // is checked in the focused regression above: process-wide MemStats also count
 // unrelated goroutines and fuzzing machinery, so are not a per-input oracle.
 func FuzzReadLoad(f *testing.F) {
@@ -579,7 +745,14 @@ func FuzzReadLoad(f *testing.F) {
 	f.Add([]byte("*3\r\n$3\r\nset\r\n$4\r\nvar1\r\n$4\r\n1234\r\n"))
 	f.Add([]byte("*2\r\n$3\r\ndel\r\n$4\r\nvar1\r\n"))
 	f.Add([]byte("*1\r\n$7\r\nflushdb\r\n"))
+	// NUL padding counts when a command follows, "*0" is a command, trailing NULs do not count.
+	f.Add([]byte("\x00\x00*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n"))
+	f.Add([]byte("*2\r\n$3\r\ndel\r\n$1\r\nk\r\n\x00\x00*1\r\n$7\r\nflushdb\r\n"))
+	f.Add([]byte("*0\r\n*2\r\n$3\r\ndel\r\n$1\r\nk\r\n"))
+	f.Add([]byte("*1\r\n$7\r\nflushdb\r\n\x00\x00\x00"))                              // trailing NULs
+	f.Add([]byte("\x00*3\r\n$3\r\nset\r\n$1\r\nk\r\n$1\r\nv\r\n*3\r\n$1\r\nS\r\n$1")) // NUL, then a truncated tail
 	f.Add([]byte("*5\r\n$3\r\nset\r\n$3\r\nvar\r\n$3\r\nval\r\n$2\r\nex\r\n$2\r\n10\r\n"))
+	f.Add([]byte("*5\r\n$7\r\nflushdb\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n")) // five parts, no TTL
 	f.Add([]byte("*5\r\n$3\r\nset\r\n$3\r\nvar\r\n$3\r\nval\r\n$2\r\nae\r\n$2\r\n10\r\n"))
 	f.Add(append([]byte{0, 0, 0}, "*2\r\n$3\r\nDEL\r\n$5\r\nHELLO\r\n"...)) // NUL padding
 	// Malformed shapes, including the two defects this step fixes.
@@ -603,6 +776,27 @@ func FuzzReadLoad(f *testing.F) {
 		// exceed the input it was derived from.
 		if n < 0 || n > int64(len(in)) {
 			t.Fatalf("readLoad returned offset %d for a %d-byte input (err=%v)", n, len(in), err)
+		}
+
+		// Only NUL bytes may follow a fully loaded input.
+		if err == nil && len(bytes.Trim(in[n:], "\x00")) != 0 {
+			t.Fatalf("readLoad stopped at %d, but in[%d:]=%q is not all NUL", n, n, in[n:])
+		}
+		// Every command ends in '\n', so an offset after a NUL counted trailing
+		// NULs. Replay below cannot see that: it repeats the same wrong offset.
+		if n > 0 && in[n-1] == 0 {
+			t.Fatalf("readLoad offset %d counts trailing NULs: in[:%d] ends %q", n, n, in[:n])
+		}
+		// in[:n] holds only complete commands and NULs, so it must reload to
+		// (n, nil). That fails if n includes a partial command.
+		// Keys come out the same unless a TTL record reads wall time.
+		db2 := newLoadTarget()
+		n2, err2 := db2.readLoad(bytes.NewReader(in[:n]), now)
+		if n2 != n || err2 != nil {
+			t.Fatalf("readLoad(in[:%d]) = (%d, %v), want (%d, nil); first err=%v", n, n2, err2, n, err)
+		}
+		if !hasTTLSet(in[:n]) && !slices.Equal(loadedKeys(db), loadedKeys(db2)) {
+			t.Fatalf("keys differ after reloading in[:%d]", n)
 		}
 	})
 }
