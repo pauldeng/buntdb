@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1025,42 +1027,120 @@ func TestVariousTx(t *testing.T) {
 }
 
 func TestNearby(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
+	// A local fixed-seed source keeps the data the same on every run.
+	rng := rand.New(rand.NewSource(20261107))
 	N := 100000
-	db, _ := Open(":memory:")
-	db.CreateSpatialIndex("points", "*", IndexRect)
-	db.Update(func(tx *Tx) error {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := db.CreateSpatialIndex("points", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
 		for i := 0; i < N; i++ {
 			p := Point(
-				rand.Float64()*100,
-				rand.Float64()*100,
-				rand.Float64()*100,
-				rand.Float64()*100,
+				rng.Float64()*100,
+				rng.Float64()*100,
+				rng.Float64()*100,
+				rng.Float64()*100,
 			)
-			tx.Set(fmt.Sprintf("p:%d", i), p, nil)
+			if _, _, err := tx.Set(fmt.Sprintf("p:%d", i), p, nil); err != nil {
+				return err
+			}
 		}
 		return nil
-	})
-	var keys, values []string
-	var dists []float64
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Keep only the count and the previous distance. Report a failure and stop
+	// the search, instead of calling t.Fatal inside the callback.
 	var pdist float64
-	var i int
-	db.View(func(tx *Tx) error {
-		tx.Nearby("points", Point(0, 0, 0, 0), func(key, value string, dist float64) bool {
-			if i != 0 && dist < pdist {
-				t.Fatal("out of order")
+	var count int
+	if err := db.View(func(tx *Tx) error {
+		return tx.Nearby("points", Point(0, 0, 0, 0), func(key, value string, dist float64) bool {
+			// !(dist >= pdist) also rejects NaN, which no ordered comparison accepts.
+			if math.IsNaN(dist) || (count != 0 && !(dist >= pdist)) {
+				t.Errorf("out of order or NaN at item %d: %v after %v", count, dist, pdist)
+				return false
 			}
-			keys = append(keys, key)
-			values = append(values, value)
-			dists = append(dists, dist)
 			pdist = dist
-			i++
+			count++
 			return true
 		})
-		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != N {
+		t.Fatalf("expected '%v', got '%v'", N, count)
+	}
+}
+
+// A small 4-D index with exact membership and known squared distances. The
+// points p4 and p5 differ only on axis four. No point equals the query, so no
+// distance is zero, and every distance is different.
+func TestNearbyFourDimensions(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
 	})
-	if len(keys) != N {
-		t.Fatalf("expected '%v', got '%v'", N, len(keys))
+	if err := db.CreateSpatialIndex("points", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	pts := map[string][4]float64{
+		"p1": {1, 0, 0, 0},
+		"p2": {0, 2, 0, 0},
+		"p3": {0, 0, 3, 0},
+		"p4": {0, 0, 0, 4},
+		"p5": {0, 0, 0, 5},
+		"p6": {2, 1, 1, 1},
+		"p7": {3, 3, 3, 3},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for key, c := range pts {
+			if _, _, err := tx.Set(key, Point(c[0], c[1], c[2], c[3]), nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"p1:1", "p2:4", "p6:7", "p3:9", "p4:16", "p5:25", "p7:36"}
+	var got []string
+	if err := db.View(func(tx *Tx) error {
+		return tx.Nearby("points", Point(0, 0, 0, 0), func(key, _ string, dist float64) bool {
+			got = append(got, fmt.Sprintf("%s:%g", key, dist))
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Nearby = %v, want %v", got, want)
+	}
+	// An early stop returns the nearest items only.
+	got = nil
+	if err := db.View(func(tx *Tx) error {
+		return tx.Nearby("points", Point(0, 0, 0, 0), func(key, _ string, dist float64) bool {
+			got = append(got, fmt.Sprintf("%s:%g", key, dist))
+			return len(got) < 3
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want[:3]) {
+		t.Errorf("Nearby stopped after 3 = %v, want %v", got, want[:3])
 	}
 }
 

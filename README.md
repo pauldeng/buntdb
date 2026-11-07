@@ -301,6 +301,24 @@ db.View(func(tx *buntdb.Tx) error {
 })
 ```
 
+### Expired items and writes during a search
+
+`Intersects` and `Nearby` skip expired items, as `Get` does. The search continues past an expired item. Each call checks expiry against one clock reading. Earlier versions returned expired items.
+
+The search stops when the callback returns `false`.
+
+Do not write to the database inside a callback. In a writable transaction, `Set` and `Delete` return `ErrTxIterating`. In a read-only transaction, they return `ErrTxNotWritable`. Earlier versions allowed writes inside `Intersects` and `Nearby` callbacks.
+
+### Nearby limits
+
+`Nearby` sorts by distance only among rects with the same number of dimensions. An index that holds both 1-D and 2-D rects can return items out of order.
+
+In an index with mixed dimensions, a callback that panics or calls `runtime.Goexit` can leak goroutines. `testing.T.Fatal` calls `runtime.Goexit`. Keep fatal test assertions outside such a callback.
+
+In an index with mixed dimensions, background goroutines can remain after the callback returns `false`. Do not rely on `Nearby` to finish before a following write.
+
+These limits come from the `github.com/tidwall/rtred` package. An index whose rects all have the same number of dimensions does not have them.
+
 ### Spatial bracket syntax
 
 The bracket syntax `[-117 30],[-112 36]` is unique to BuntDB, and it's how the built-in rectangles are processed. But, you are not limited to this syntax. Whatever Rect function you choose to use during `CreateSpatialIndex` will be used to process the parameter, in this case it's `IndexRect`.

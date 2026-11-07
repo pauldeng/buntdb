@@ -201,10 +201,15 @@ func (db *DB) Close() error {
 // writes, but not reads. This can be used for snapshots and backups for pure
 // in-memory databases using the ":memory:". Database that persist to disk
 // can be snapshotted by simply copying the database file.
+//
+// Save returns ErrDatabaseClosed if the database is closed.
 func (db *DB) Save(wr io.Writer) error {
 	var err error
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
 	// use a buffered writer and flush every 4MB
 	var buf []byte
 	// iterated through every item in the database and write to the buffer
@@ -237,9 +242,15 @@ func (db *DB) Save(wr io.Writer) error {
 // Load loads commands from reader. This operation blocks all reads and writes.
 // Note that this can only work for fully in-memory databases opened with
 // Open(":memory:").
+//
+// Load returns ErrDatabaseClosed if the database is closed. It checks this
+// before it returns ErrPersistenceActive.
 func (db *DB) Load(rd io.Reader) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
 	if db.persist {
 		// cannot load into databases that persist to disk
 		return ErrPersistenceActive
@@ -1533,6 +1544,32 @@ func (o *dbItemOpts) expiredNow() bool {
 	return o.ex && time.Now().After(o.exat)
 }
 
+// expiredAt reports whether an expiring item's deadline has passed at now.
+func (o *dbItemOpts) expiredAt(now time.Time) bool {
+	return o.ex && now.After(o.exat)
+}
+
+// lazyClock gives one clock reading to a whole traversal. It reads the clock
+// on the first item that can expire, so a traversal without TTL items never
+// reads it.
+type lazyClock struct {
+	now time.Time
+}
+
+// past reports whether o's deadline has passed at the single clock reading.
+func (c *lazyClock) past(o *dbItemOpts) bool {
+	if c.now.IsZero() {
+		c.now = time.Now()
+	}
+	return o.expiredAt(c.now)
+}
+
+// expired reports whether dbi has expired as of the clock's single reading.
+// The check for an item without a TTL inlines, so it costs no call.
+func (c *lazyClock) expired(dbi *dbItem) bool {
+	return dbi.opts != nil && dbi.opts.ex && c.past(dbi.opts)
+}
+
 // MaxTime from http://stackoverflow.com/questions/25065055#32620397
 // This is a long time in the future. It's an imaginary number that is
 // used for b-tree ordering.
@@ -2104,6 +2141,23 @@ func (r *rect) Rect(ctx interface{}) (min, max []float64) {
 // An invalid index will return an error.
 // The dist param is the distance of the bounding boxes. In the case of
 // simple 2D points, it's the distance of the two 2D points squared.
+//
+// Nearby skips expired items, as Get does. It checks expiry against one clock
+// reading per call. The search stops when the iterator returns false.
+//
+// In a writable transaction, Set and Delete return ErrTxIterating inside the
+// iterator. In a read-only transaction, they return ErrTxNotWritable.
+//
+// Nearby sorts by distance only among items with the same number of
+// dimensions. An index that holds rects of different dimensions can return
+// them out of order.
+//
+// In such an index, an iterator that panics or calls runtime.Goexit can leak
+// goroutines. testing.T.Fatal calls runtime.Goexit. Keep fatal assertions out
+// of the iterator.
+//
+// In such an index, background goroutines can remain after the iterator
+// returns false. Do not rely on Nearby to finish before a following write.
 func (tx *Tx) Nearby(index, bounds string,
 	iterator func(key, value string, dist float64) bool) error {
 	if tx.db == nil {
@@ -2113,9 +2167,13 @@ func (tx *Tx) Nearby(index, bounds string,
 		// cannot search on keys tree. just return nil.
 		return nil
 	}
-	// // wrap a rtree specific iterator around the user-defined iterator.
+	// wrap a rtree specific iterator around the user-defined iterator.
+	var clock lazyClock
 	iter := func(item rtred.Item, dist float64) bool {
 		dbi := item.(*dbItem)
+		if clock.expired(dbi) {
+			return true
+		}
 		return iterator(dbi.key, dbi.val, dist)
 	}
 	idx := tx.db.idxs[index]
@@ -2132,6 +2190,12 @@ func (tx *Tx) Nearby(index, bounds string,
 	if idx.rect != nil {
 		min, max = idx.rect(bounds)
 	}
+	if tx.wc != nil {
+		tx.wc.itercount++
+		defer func() {
+			tx.wc.itercount--
+		}()
+	}
 	// set the center param to false, which uses the box dist calc.
 	idx.rtr.KNN(&rect{min, max}, false, iter)
 	return nil
@@ -2142,6 +2206,12 @@ func (tx *Tx) Nearby(index, bounds string,
 // is represented by the rect string. This string will be processed by the
 // same bounds function that was passed to the CreateSpatialIndex() function.
 // An invalid index will return an error.
+//
+// Intersects skips expired items, as Get does. It checks expiry against one
+// clock reading per call. The search stops when the iterator returns false.
+//
+// In a writable transaction, Set and Delete return ErrTxIterating inside the
+// iterator. In a read-only transaction, they return ErrTxNotWritable.
 func (tx *Tx) Intersects(index, bounds string,
 	iterator func(key, value string) bool) error {
 	if tx.db == nil {
@@ -2152,8 +2222,12 @@ func (tx *Tx) Intersects(index, bounds string,
 		return nil
 	}
 	// wrap a rtree specific iterator around the user-defined iterator.
+	var clock lazyClock
 	iter := func(item rtred.Item) bool {
 		dbi := item.(*dbItem)
+		if clock.expired(dbi) {
+			return true
+		}
 		return iterator(dbi.key, dbi.val)
 	}
 	idx := tx.db.idxs[index]
@@ -2169,6 +2243,12 @@ func (tx *Tx) Intersects(index, bounds string,
 	var min, max []float64
 	if idx.rect != nil {
 		min, max = idx.rect(bounds)
+	}
+	if tx.wc != nil {
+		tx.wc.itercount++
+		defer func() {
+			tx.wc.itercount--
+		}()
 	}
 	idx.rtr.Search(&rect{min, max}, iter)
 	return nil

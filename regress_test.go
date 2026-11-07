@@ -1231,3 +1231,347 @@ func TestRegressLegacyExpiryBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// Save and Load dereferenced the nil trees of a closed database, and Load
+// reported ErrPersistenceActive before it looked at the closed state.
+func TestRegressSaveLoadAfterClose(t *testing.T) {
+	for _, mode := range []string{"memory", "persistent"} {
+		t.Run(mode, func(t *testing.T) {
+			path := ":memory:"
+			if mode == "persistent" {
+				path = filepath.Join(t.TempDir(), "closed.db")
+			}
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				_, _, err := tx.Set("k", "v", nil)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, op := range []struct {
+				name string
+				run  func() error
+			}{
+				{"Save", func() error { return db.Save(io.Discard) }},
+				{"Load", func() error { return db.Load(bytes.NewReader(appendSet(nil, "k2", "v2"))) }},
+			} {
+				var err error
+				var panicked any
+				func() {
+					defer func() { panicked = recover() }()
+					err = op.run()
+				}()
+				if panicked != nil {
+					t.Errorf("%s after Close panicked: %v", op.name, panicked)
+				} else if err != ErrDatabaseClosed {
+					t.Errorf("%s after Close = %v, want ErrDatabaseClosed", op.name, err)
+				}
+			}
+		})
+	}
+}
+
+// spatialAPI runs one spatial search with a key-only callback, so a test can
+// treat Intersects and Nearby alike. The query covers every fixture point.
+type spatialAPI struct {
+	name string
+	run  func(tx *Tx, fn func(key string) bool) error
+}
+
+var spatialAPIs = []spatialAPI{
+	{"Intersects", func(tx *Tx, fn func(string) bool) error {
+		return tx.Intersects("pts", "[0 0],[100 100]", func(key, _ string) bool { return fn(key) })
+	}},
+	{"Nearby", func(tx *Tx, fn func(string) bool) error {
+		return tx.Nearby("pts", "[0 0]", func(key, _ string, _ float64) bool { return fn(key) })
+	}},
+}
+
+// setupExpiredSpatial creates the index "pts" and three 2-D points: p1 is
+// already expired, and is both first in insertion order and nearest to [0 0];
+// p2 has no TTL; p3 has a TTL that has not passed. It runs in tx, so the
+// background manager cannot sweep p1 before the test searches.
+func setupExpiredSpatial(tx *Tx) error {
+	if err := tx.CreateSpatialIndex("pts", "*", IndexRect); err != nil {
+		return err
+	}
+	for _, p := range []struct {
+		key  string
+		xy   float64
+		opts *SetOptions
+	}{
+		{"p1", 1, &SetOptions{Expires: true, TTL: -time.Hour}},
+		{"p2", 2, nil},
+		{"p3", 3, &SetOptions{Expires: true, TTL: time.Hour}},
+	} {
+		if _, _, err := tx.Set(p.key, Point(p.xy, p.xy), p.opts); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Get("p1"); err != ErrNotFound {
+		return fmt.Errorf("Get of the expired point = %v, want ErrNotFound", err)
+	}
+	return nil
+}
+
+// Intersects and Nearby returned expired items that Get hides. The fixture
+// never waits on the clock, and it keeps p1 in the tree until the search runs.
+func TestRegressSpatialSkipsExpired(t *testing.T) {
+	// check runs every search in tx. Nearby order is exact. Intersects order is
+	// not specified, so it compares sorted keys.
+	check := func(t *testing.T, tx *Tx) error {
+		for _, api := range spatialAPIs {
+			var got []string
+			if err := api.run(tx, func(key string) bool {
+				got = append(got, key)
+				return true
+			}); err != nil {
+				return fmt.Errorf("%s: %w", api.name, err)
+			}
+			if api.name == "Intersects" {
+				slices.Sort(got)
+			}
+			if want := []string{"p2", "p3"}; !slices.Equal(got, want) {
+				t.Errorf("%s returned %v, want %v", api.name, got, want)
+			}
+
+			// The callback's false must stop the search after the first live
+			// item. A wrapper that drops it makes more than one call.
+			var calls int
+			var first string
+			if err := api.run(tx, func(key string) bool {
+				calls++
+				first = key
+				return false
+			}); err != nil {
+				return fmt.Errorf("%s: %w", api.name, err)
+			}
+			if calls != 1 || (first != "p2" && first != "p3") {
+				t.Errorf("%s with early stop: %d calls, first key %q; want 1 call, a live key",
+					api.name, calls, first)
+			}
+		}
+		return nil
+	}
+
+	t.Run("writable", func(t *testing.T) {
+		db, err := Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if err := db.Update(func(tx *Tx) error {
+			if err := setupExpiredSpatial(tx); err != nil {
+				return err
+			}
+			return check(t, tx)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("read-only", func(t *testing.T) {
+		// A DB without the background manager keeps the expired item.
+		db := newLoadTarget()
+		if err := db.Update(setupExpiredSpatial); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.View(func(tx *Tx) error { return check(t, tx) }); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// Set and Delete were allowed inside Intersects and Nearby callbacks, which
+// changed the tree under the traversal. Each callback below runs once and
+// returns false, so unfixed code cannot traverse a tree it has changed.
+func TestRegressSpatialWriteDuringIteration(t *testing.T) {
+	mutations := []struct {
+		name string
+		run  func(tx *Tx) error
+	}{
+		{"Set", func(tx *Tx) error { _, _, err := tx.Set("p2", Point(2, 2), nil); return err }},
+		{"Delete", func(tx *Tx) error { _, err := tx.Delete("p1"); return err }},
+	}
+	newDB := func(t *testing.T) *DB {
+		t.Helper()
+		db, err := Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		if err := db.Update(func(tx *Tx) error {
+			if err := tx.CreateSpatialIndex("pts", "*", IndexRect); err != nil {
+				return err
+			}
+			_, _, err := tx.Set("p1", Point(1, 1), nil)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+
+	for _, api := range spatialAPIs {
+		for _, mut := range mutations {
+			t.Run(api.name+"/"+mut.name+"/writable", func(t *testing.T) {
+				db := newDB(t)
+				if err := db.Update(func(tx *Tx) error {
+					var calls int
+					var inErr error
+					if err := api.run(tx, func(string) bool {
+						calls++
+						inErr = mut.run(tx)
+						return false
+					}); err != nil {
+						return err
+					}
+					if calls != 1 || inErr != ErrTxIterating {
+						t.Errorf("%d callbacks, %s inside = %v; want 1 callback, ErrTxIterating",
+							calls, mut.name, inErr)
+					}
+					// The traversal has ended, so the same mutation must work now.
+					if err := mut.run(tx); err != nil {
+						t.Errorf("%s after the search = %v, want nil", mut.name, err)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+			t.Run(api.name+"/"+mut.name+"/read-only", func(t *testing.T) {
+				db := newDB(t)
+				if err := db.View(func(tx *Tx) error {
+					var calls int
+					var inErr error
+					if err := api.run(tx, func(string) bool {
+						calls++
+						inErr = mut.run(tx)
+						return false
+					}); err != nil {
+						return err
+					}
+					if calls != 1 || inErr != ErrTxNotWritable {
+						t.Errorf("%d callbacks, %s inside = %v; want 1 callback, ErrTxNotWritable",
+							calls, mut.name, inErr)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+
+	// A write is still rejected after an inner traversal returns, while the
+	// outer callback is active. A counter reset by the inner exit would allow it.
+	for _, outer := range spatialAPIs {
+		for _, inner := range spatialAPIs {
+			t.Run("nested/"+outer.name+"/"+inner.name, func(t *testing.T) {
+				db := newDB(t)
+				if err := db.Update(func(tx *Tx) error {
+					var calls, innerCalls int
+					var afterInner error
+					if err := outer.run(tx, func(string) bool {
+						calls++
+						if err := inner.run(tx, func(string) bool {
+							innerCalls++
+							return false
+						}); err != nil {
+							t.Errorf("inner %s = %v", inner.name, err)
+						}
+						_, _, afterInner = tx.Set("p2", Point(2, 2), nil)
+						return false
+					}); err != nil {
+						return err
+					}
+					if calls != 1 || innerCalls != 1 || afterInner != ErrTxIterating {
+						t.Errorf("%d outer, %d inner callbacks, Set after inner = %v; want 1, 1, ErrTxIterating",
+							calls, innerCalls, afterInner)
+					}
+					if _, _, err := tx.Set("p2", Point(2, 2), nil); err != nil {
+						t.Errorf("Set after both searches = %v, want nil", err)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+
+	// A panic in the callback must release the counter. The recover is in the
+	// same Update callback, so a stuck counter would reject the final Set. A
+	// new transaction would hide that.
+	for _, api := range spatialAPIs {
+		t.Run("panic/"+api.name, func(t *testing.T) {
+			db := newDB(t)
+			const sentinel = "spatial callback panic"
+			if err := db.Update(func(tx *Tx) error {
+				var recovered any
+				var inErr error
+				var calls int
+				func() {
+					defer func() { recovered = recover() }()
+					_ = api.run(tx, func(string) bool {
+						calls++
+						_, _, inErr = tx.Set("p2", Point(2, 2), nil)
+						panic(sentinel)
+					})
+				}()
+				if recovered != sentinel || calls != 1 {
+					t.Errorf("recovered %v after %d callbacks, want %q after 1", recovered, calls, sentinel)
+				}
+				if inErr != ErrTxIterating {
+					t.Errorf("Set inside the callback = %v, want ErrTxIterating", inErr)
+				}
+				if _, _, err := tx.Set("p2", Point(2, 2), nil); err != nil {
+					t.Errorf("Set after the panic = %v, want nil (iteration counter stuck)", err)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// lazyClock must read the clock at most once per traversal, and only for an
+// item that can expire.
+func TestLazyClockReadsOnce(t *testing.T) {
+	var c lazyClock
+	if c.expired(&dbItem{key: "a"}) || c.expired(&dbItem{key: "b", opts: &dbItemOpts{}}) {
+		t.Error("an item without a TTL reported expired")
+	}
+	if !c.now.IsZero() {
+		t.Error("the clock was read for items without a TTL")
+	}
+
+	live := &dbItem{key: "c", opts: &dbItemOpts{ex: true, exat: time.Now().Add(time.Hour)}}
+	if c.expired(live) {
+		t.Error("an item with an hour left reported expired")
+	}
+	if c.now.IsZero() {
+		t.Fatal("the clock was not read for an item with a TTL")
+	}
+
+	// A later reading would say live, so only the stored reading can say expired.
+	c.now = time.Now().Add(2 * time.Hour)
+	stored := c.now
+	if !c.expired(live) {
+		t.Error("the stored reading was not used")
+	}
+	if !c.now.Equal(stored) {
+		t.Error("the clock was read again")
+	}
+}
