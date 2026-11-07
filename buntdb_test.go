@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -2433,6 +2434,95 @@ func benchOpenFillData(t *testing.B, N int,
 	}
 	t.StartTimer()
 	return db, keys, vals
+}
+
+// Benchmark_Commit_Persist times persistent write transactions (P2: commit
+// buffer retention). Each size=NMiB case is one transaction of about N MiB. The
+// mixed case is one 72 MiB transaction followed by one small one, so the release
+// of a buffer above maxRetainedBuf is timed too. Values come from a fixed seed.
+// The file is replaced every perDB iterations so that it stays small, and that
+// teardown runs with the timer stopped.
+func Benchmark_Commit_Persist(b *testing.B) {
+	const valSize, poolSize = 1024, 1024
+	rng := rand.New(rand.NewSource(1))
+	pool := make([]string, poolSize)
+	val := make([]byte, valSize)
+	for i := range pool {
+		for j := range val {
+			val[j] = 'a' + byte(rng.Intn(26))
+		}
+		pool[i] = string(val)
+	}
+	for _, tc := range []struct {
+		name  string
+		mib   int
+		mixed bool
+		perDB int
+	}{
+		{"size=1MiB", 1, false, 16},
+		{"size=4MiB", 4, false, 16},
+		{"size=8MiB", 8, false, 16},
+		{"mixed", 72, true, 4},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			keys := make([]string, tc.mib<<20/valSize)
+			for i := range keys {
+				keys[i] = testUint64Hex(uint64(i))
+			}
+			update := func(db *DB, n int) {
+				if err := db.Update(func(tx *Tx) error {
+					for j := range n {
+						if _, _, err := tx.Set(keys[j], pool[j%poolSize], nil); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			path := filepath.Join(b.TempDir(), "commit.db")
+			var db *DB
+			closeDB := func() {
+				if db != nil {
+					if err := db.Close(); err != nil {
+						b.Fatal(err)
+					}
+					db = nil // do not keep the closed DB alive across the next Open
+				}
+			}
+			b.Cleanup(closeDB) // also on b.Fatal
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if i%tc.perDB == 0 {
+					b.StopTimer()
+					closeDB()
+					if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+						b.Fatal(err)
+					}
+					var err error
+					if db, err = Open(path); err != nil {
+						b.Fatal(err)
+					}
+					var cfg Config
+					if err := db.ReadConfig(&cfg); err != nil {
+						b.Fatal(err)
+					}
+					cfg.AutoShrinkDisabled = true
+					if err := db.SetConfig(cfg); err != nil {
+						b.Fatal(err)
+					}
+					b.StartTimer()
+				}
+				update(db, len(keys))
+				if tc.mixed {
+					update(db, 1)
+				}
+			}
+			b.StopTimer()
+			closeDB()
+		})
+	}
 }
 
 func benchSetGet(t *testing.B, set, persist, random bool, batch int) {

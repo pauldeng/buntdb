@@ -1136,6 +1136,13 @@ func TestControlWriterGoldenBytes(t *testing.T) {
 			if got := string(tc.item.writeSetTo(nil)); got != tc.want {
 				t.Errorf("writeSetTo = %q, want %q", got, tc.want)
 			}
+			// C7: the size estimate must equal the bytes the writer emits.
+			if est := tc.item.estAOFSetSize(); est != len(tc.want) {
+				t.Errorf("estAOFSetSize = %d, writer emits %d bytes", est, len(tc.want))
+			}
+			if n := testing.AllocsPerRun(100, func() { _ = tc.item.estAOFSetSize() }); n != 0 {
+				t.Errorf("estAOFSetSize allocates %v times per call, want 0", n)
+			}
 			// The writer must not allocate once the buffer has room.
 			buf := make([]byte, 0, 256)
 			if n := testing.AllocsPerRun(100, func() { buf = tc.item.writeSetTo(buf[:0]) }); n != 0 {
@@ -1982,4 +1989,99 @@ func TestRegressLoadAccumulatesInt64(t *testing.T) {
 	if db.lastaofsz != want {
 		t.Fatalf("lastaofsz = %d, want %d", db.lastaofsz, want)
 	}
+}
+
+// P2: db.buf kept the capacity of the largest transaction. Commit now frees the
+// buffer after a transaction that serialized to more than maxRetainedBuf bytes,
+// and keeps it for reuse otherwise, whatever capacity append growth gave it.
+func TestRegressCommitBufferRelease(t *testing.T) {
+	big := strings.Repeat("x", maxRetainedBuf) // substrings of it are the values
+	// commit sets keys "0".."n-1" to val in one transaction.
+	commit := func(t *testing.T, db *DB, n int, val string) {
+		t.Helper()
+		if err := db.Update(func(tx *Tx) error {
+			for i := range n {
+				if _, _, err := tx.Set(strconv.Itoa(i), val, nil); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// buf returns the length, capacity and first byte address of db.buf.
+	buf := func(db *DB) (n, c int, p *byte) {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		if cap(db.buf) == 0 {
+			return 0, 0, nil
+		}
+		return len(db.buf), cap(db.buf), &db.buf[:1][0]
+	}
+	open := func(t *testing.T) *DB {
+		t.Helper()
+		db, err := Open(filepath.Join(t.TempDir(), "data.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return db
+	}
+	// A single record "0" -> v bytes serializes to 25+len(itoa(v))+v bytes.
+	const overhead = 25 + len("67108839")
+	exact := maxRetainedBuf - overhead
+
+	t.Run("a commit keeps its buffer for reuse", func(t *testing.T) {
+		db := open(t)
+		commit(t, db, 1, big[:1<<20])
+		n, c, p := buf(db)
+		if n < 1<<20 || p == nil {
+			t.Fatalf("len, cap(db.buf) = %d, %d after a 1 MiB commit, want a kept buffer", n, c)
+		}
+		commit(t, db, 1, big[:1<<20])
+		if _, c2, p2 := buf(db); c2 != c || p2 != p {
+			t.Fatalf("the second commit did not reuse the %d byte buffer", c)
+		}
+	})
+	t.Run("capacity slack does not count", func(t *testing.T) {
+		// Append growth can leave the buffer of a transaction under the limit
+		// with more than maxRetainedBuf bytes of capacity. Seed that state, so
+		// that the test does not depend on the runtime's growth policy.
+		db := open(t)
+		seed := make([]byte, 0, maxRetainedBuf+1<<20)
+		db.mu.Lock()
+		db.buf = seed
+		db.mu.Unlock()
+		commit(t, db, 5, "v")
+		if n, c, p := buf(db); n == 0 || n >= maxRetainedBuf || c != cap(seed) || p != &seed[:1][0] {
+			t.Fatalf("len, cap(db.buf) = %d, %d after a small commit, want the seeded %d byte buffer kept", n, c, cap(seed))
+		}
+	})
+	t.Run("exactly the limit is kept", func(t *testing.T) {
+		db := open(t)
+		commit(t, db, 1, big[:exact])
+		n, _, p := buf(db)
+		if n != maxRetainedBuf {
+			t.Fatalf("len(db.buf) = %d, want exactly %d: fix the overhead constant", n, maxRetainedBuf)
+		}
+		if p == nil {
+			t.Fatalf("the buffer of a %d byte transaction was freed", n)
+		}
+	})
+	t.Run("one byte over the limit is freed", func(t *testing.T) {
+		db := open(t)
+		commit(t, db, 1, big[:exact+1])
+		if n, c, _ := buf(db); n != 0 || c != 0 {
+			t.Fatalf("len, cap(db.buf) = %d, %d after a transaction over the limit, want 0, 0", n, c)
+		}
+		commit(t, db, 1, big[:1<<20]) // the next commit starts a fresh, small buffer
+		if _, c, _ := buf(db); c < 1<<20 || c > 4<<20 {
+			t.Fatalf("cap(db.buf) = %d after a 1 MiB commit, want a small kept buffer", c)
+		}
+	})
 }

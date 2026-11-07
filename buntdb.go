@@ -894,6 +894,13 @@ func panicErr(err error) {
 // that really are large.
 const minLoadGrowth = 64 * 1024
 
+// maxRetainedBuf is the largest transaction, in serialized bytes, whose commit
+// buffer is kept for reuse. The buffer of a transaction up to this size stays
+// with the DB between commits, whatever capacity append growth gave it. The
+// buffer of a larger one is freed after its commit, so one huge transaction
+// does not pin its memory.
+const maxRetainedBuf = 64 << 20
+
 // parseRESPLen parses the numeric portion of a RESP header line such as
 // "*3\r\n" or "$12\r\n". The length is untrusted input, so non-digits and
 // arithmetic overflow are rejected rather than wrapping to a negative value.
@@ -1452,6 +1459,9 @@ func (tx *Tx) Commit() error {
 		// rollback.
 		var n int
 		n, err = tx.db.file.Write(tx.db.buf)
+		if len(tx.db.buf) > maxRetainedBuf { // this commit's serialized size
+			tx.db.buf = nil
+		}
 		if err != nil {
 			if n > 0 {
 				// There was a partial write to disk.
@@ -1545,8 +1555,22 @@ func estBulkStringSize(s string) int {
 	return 1 + estIntSize(len(s)) + 2 + len(s) + 2
 }
 
-// estAOFSetSize returns an estimated number of bytes that this item will use
-// when stored in the aof file.
+// estBulkInt64Size returns the size of n written by appendBulkInt: the signed
+// decimal digits as a bulk string. It does not allocate.
+func estBulkInt64Size(n int64) int {
+	u := uint64(n)
+	digits := 1
+	if n < 0 {
+		u = -u   // wraps correctly for math.MinInt64
+		digits++ // the sign
+	}
+	for ; u >= 10; u /= 10 {
+		digits++
+	}
+	return 1 + estIntSize(digits) + 2 + digits + 2
+}
+
+// estAOFSetSize returns the number of bytes writeSetTo appends for this item.
 func (dbi *dbItem) estAOFSetSize() int {
 	var n int
 	if dbi.opts != nil && dbi.opts.ex {
@@ -1554,8 +1578,8 @@ func (dbi *dbItem) estAOFSetSize() int {
 		n += estBulkStringSize("set")
 		n += estBulkStringSize(dbi.key)
 		n += estBulkStringSize(dbi.val)
-		n += estBulkStringSize("ex")
-		n += estBulkStringSize("99") // estimate two byte bulk string
+		n += estBulkStringSize("ae")
+		n += estBulkInt64Size(dbi.opts.exat.Unix())
 	} else {
 		n += estArraySize(3)
 		n += estBulkStringSize("set")
