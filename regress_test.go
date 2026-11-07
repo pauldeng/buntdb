@@ -1575,3 +1575,288 @@ func TestLazyClockReadsOnce(t *testing.T) {
 		t.Error("the clock was read again")
 	}
 }
+
+// dbState captures keys, values, expiry times and the contents of every index,
+// including spatial ones, so a test can compare two states exactly.
+func dbState(t *testing.T, db *DB) string {
+	t.Helper()
+	var sb strings.Builder
+	if err := db.View(func(tx *Tx) error {
+		names, err := tx.Indexes()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&sb, "indexes=%v\n", names)
+		err = tx.Ascend("", func(key, val string) bool {
+			item := tx.db.get(key)
+			fmt.Fprintf(&sb, "key %s=%s", key, val)
+			if item.opts != nil {
+				fmt.Fprintf(&sb, " exat=%d", item.opts.exat.UnixNano())
+			}
+			sb.WriteByte('\n')
+			return true
+		})
+		if err != nil {
+			return err
+		}
+		btreeAscend(tx.db.exps, func(item any) bool {
+			dbi := item.(*dbItem)
+			fmt.Fprintf(&sb, "exp %s exat=%d\n", dbi.key, dbi.opts.exat.UnixNano())
+			return true
+		})
+		for _, name := range names {
+			fmt.Fprintf(&sb, "index %s\n", name)
+			var lines []string
+			emit := func(key, val string) bool {
+				lines = append(lines, "  "+key+"="+val+"\n")
+				return true
+			}
+			if tx.db.idxs[name].rect != nil {
+				// R-tree order is unspecified.
+				err = tx.Intersects(name, "[-1000 -1000],[1000 1000]", emit)
+				slices.Sort(lines)
+			} else {
+				err = tx.Ascend(name, emit)
+			}
+			if err != nil {
+				return err
+			}
+			sb.WriteString(strings.Join(lines, ""))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return sb.String()
+}
+
+// newDeleteAllFixture opens an in-memory database with a string index "old", a
+// spatial index "geo", three keys and one TTL.
+func newDeleteAllFixture(t *testing.T) *DB {
+	t.Helper()
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := db.CreateIndex("old", "*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSpatialIndex("geo", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for _, kv := range [][2]string{{"a", Point(1, 1)}, {"b", Point(2, 2)}, {"c", Point(3, 3)}} {
+			var opts *SetOptions
+			if kv[0] == "b" {
+				opts = &SetOptions{Expires: true, TTL: time.Hour}
+			}
+			if _, _, err := tx.Set(kv[0], kv[1], opts); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// A second DeleteAll rebuilt the indexes from the map saved by the first one,
+// so an index created or dropped in between came back in its old form.
+func TestRegressDeleteAllTwiceRebuildsCurrentIndexes(t *testing.T) {
+	db := newDeleteAllFixture(t)
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.DeleteAll(); err != nil {
+			return err
+		}
+		if err := tx.CreateIndex("new", "*", IndexString); err != nil {
+			return err
+		}
+		if err := tx.DropIndex("old"); err != nil {
+			return err
+		}
+		// Both indexes hold an item, so the second DeleteAll must clear them.
+		if _, _, err := tx.Set("mid", Point(5, 5), nil); err != nil {
+			return err
+		}
+		if err := tx.DeleteAll(); err != nil {
+			return err
+		}
+		names, err := tx.Indexes()
+		if err != nil {
+			return err
+		}
+		if want := []string{"geo", "new"}; !slices.Equal(names, want) {
+			return fmt.Errorf("indexes after the second DeleteAll = %v, want %v", names, want)
+		}
+		// The rebuilt indexes must be empty, then track later writes.
+		if _, _, err := tx.Set("d", Point(4, 4), nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := "indexes=[geo new]\n" +
+		"key d=" + Point(4, 4) + "\n" +
+		"index geo\n  d=" + Point(4, 4) + "\n" +
+		"index new\n  d=" + Point(4, 4) + "\n"
+	if got := dbState(t, db); got != want {
+		t.Errorf("state after commit:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// Rollback after one or two DeleteAll calls restores keys, expiry times and
+// every index, whatever the transaction did to the index definitions.
+func TestControlDeleteAllRollbackRestoresState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(tx *Tx) error
+	}{
+		{"one", func(tx *Tx) error { return tx.DeleteAll() }},
+		{"two", func(tx *Tx) error {
+			if err := tx.DeleteAll(); err != nil {
+				return err
+			}
+			return tx.DeleteAll()
+		}},
+		{"index changes between", func(tx *Tx) error {
+			for _, step := range []func() error{
+				tx.DeleteAll,
+				func() error { return tx.CreateIndex("new", "*", IndexString) },
+				func() error { return tx.DropIndex("old") },
+				func() error { return tx.DropIndex("geo") },
+				tx.DeleteAll,
+				func() error { _, _, err := tx.Set("d", "x", nil); return err },
+			} {
+				if err := step(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}},
+		{"changes before and after", func(tx *Tx) error {
+			for _, step := range []func() error{
+				func() error { _, _, err := tx.Set("a", Point(8, 8), nil); return err },
+				func() error { _, _, err := tx.Set("a", Point(9, 9), nil); return err },
+				func() error { _, _, err := tx.Set("newk", Point(7, 7), nil); return err },
+				func() error { _, _, err := tx.Set("newk", Point(6, 6), nil); return err },
+				func() error { _, _, err := tx.Set("b", Point(5, 5), nil); return err }, // drops the TTL
+				func() error { _, err := tx.Delete("c"); return err },
+				func() error { return tx.CreateIndex("early", "*", IndexString) },
+				func() error { return tx.DropIndex("old") },
+				tx.DeleteAll,
+				func() error { return tx.DropIndex("early") },
+				func() error { return tx.CreateIndex("old", "*", Desc(IndexString)) },
+				func() error { return tx.CreateIndex("late", "*", IndexString) },
+				tx.DeleteAll,
+				func() error { _, _, err := tx.Set("a", "z", nil); return err },
+			} {
+				if err := step(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newDeleteAllFixture(t)
+			before := dbState(t, db)
+			rollback := errors.New("rollback")
+			if err := db.Update(func(tx *Tx) error {
+				if err := tc.run(tx); err != nil {
+					return err
+				}
+				return rollback
+			}); err != rollback {
+				t.Fatalf("Update = %v, want the rollback error", err)
+			}
+			if after := dbState(t, db); after != before {
+				t.Errorf("state after rollback:\n%s\nwant:\n%s", after, before)
+			}
+		})
+	}
+}
+
+// Set computed its previous value and replaced flag only when no DeleteAll
+// had run in the transaction. Both modes must agree.
+func TestRegressSetAfterDeleteAllReportsPrevious(t *testing.T) {
+	for _, deleteAll := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deleteAll=%v", deleteAll), func(t *testing.T) {
+			db := newDeleteAllFixture(t)
+			if err := db.Update(func(tx *Tx) error {
+				// "a" exists in the fixture. Both modes remove it first.
+				if deleteAll {
+					if err := tx.DeleteAll(); err != nil {
+						return err
+					}
+				} else if _, err := tx.Delete("a"); err != nil {
+					return err
+				}
+				for _, step := range []struct {
+					value    string
+					ttl      time.Duration // non-zero sets an expiry
+					wantPrev string
+					wantRep  bool
+				}{
+					{"v1", 0, "", false},
+					{"v2", 0, "v1", true},
+					{"v3", -time.Hour, "v2", true}, // stored already expired
+					{"v4", 0, "", false},           // expired previous item
+				} {
+					var opts *SetOptions
+					if step.ttl != 0 {
+						opts = &SetOptions{Expires: true, TTL: step.ttl}
+					}
+					prev, rep, err := tx.Set("a", step.value, opts)
+					if err != nil {
+						return err
+					}
+					if prev != step.wantPrev || rep != step.wantRep {
+						t.Errorf("Set(%q) = (%q, %v), want (%q, %v)",
+							step.value, prev, rep, step.wantPrev, step.wantRep)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// Delete after DeleteAll already reported correctly. This pins it next to Set.
+func TestControlDeleteAfterDeleteAll(t *testing.T) {
+	db := newDeleteAllFixture(t)
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.DeleteAll(); err != nil {
+			return err
+		}
+		if _, err := tx.Delete("a"); err != ErrNotFound {
+			t.Errorf("Delete of a key removed by DeleteAll = %v, want ErrNotFound", err)
+		}
+		if _, _, err := tx.Set("k", "v1", nil); err != nil {
+			return err
+		}
+		if val, err := tx.Delete("k"); err != nil || val != "v1" {
+			t.Errorf("Delete = (%q, %v), want (\"v1\", nil)", val, err)
+		}
+		if _, err := tx.Delete("k"); err != ErrNotFound {
+			t.Errorf("second Delete = %v, want ErrNotFound", err)
+		}
+		if _, _, err := tx.Set("k", "v2", &SetOptions{Expires: true, TTL: -time.Hour}); err != nil {
+			return err
+		}
+		if _, err := tx.Delete("k"); err != ErrNotFound {
+			t.Errorf("Delete of an expired item = %v, want ErrNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1230,12 +1230,13 @@ func (tx *Tx) DeleteAll() error {
 	}
 
 	// now reset the live database trees
+	idxs := tx.db.idxs
 	tx.db.keys = btreeNew(lessCtx(nil))
 	tx.db.exps = btreeNew(lessCtx(&exctx{tx.db}))
-	tx.db.idxs = make(map[string]*index)
+	tx.db.idxs = make(map[string]*index, len(idxs))
 
-	// finally re-create the indexes
-	for name, idx := range tx.wc.rbidxs {
+	// finally re-create the current indexes, not the ones saved for rollback
+	for name, idx := range idxs {
 		tx.db.idxs[name] = idx.clearCopy()
 	}
 
@@ -1707,27 +1708,16 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	// Insert the item into the keys tree.
 	prev := tx.db.insertIntoDatabase(item)
 
+	// An expired previous item does not count as replaced.
+	if prev != nil && !prev.expired() {
+		previousValue, replaced = prev.val, true
+	}
 	// insert into the rollback map if there has not been a deleteAll.
 	if tx.wc.rbkeys == nil {
-		if prev == nil {
-			// An item with the same key did not previously exist. Let's
-			// create a rollback entry with a nil value. A nil value indicates
-			// that the entry should be deleted on rollback. When the value is
-			// *not* nil, that means the entry should be reverted.
-			if _, ok := tx.wc.rollbackItems[key]; !ok {
-				tx.wc.rollbackItems[key] = nil
-			}
-		} else {
-			// A previous item already exists in the database. Let's create a
-			// rollback entry with the item as the value. We need to check the
-			// map to see if there isn't already an item that matches the
-			// same key.
-			if _, ok := tx.wc.rollbackItems[key]; !ok {
-				tx.wc.rollbackItems[key] = prev
-			}
-			if !prev.expired() {
-				previousValue, replaced = prev.val, true
-			}
+		// A nil prev marks the key for deletion on rollback. A non-nil prev
+		// restores that item. The first entry for a key takes precedence.
+		if _, ok := tx.wc.rollbackItems[key]; !ok {
+			tx.wc.rollbackItems[key] = prev
 		}
 	}
 	// For commits we simply assign the item to the map. We use this map to
