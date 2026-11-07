@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1858,5 +1859,95 @@ func TestControlDeleteAfterDeleteAll(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// C13: the shrink threshold overflowed int on 32-bit and wrapped int64 for
+// large sizes. shrinkDue is compared with exact big-integer arithmetic, and the
+// key boundary cases are listed explicitly. The 386 run is what exposes the int
+// width; amd64 exposes the int64 wrap at 2^62.
+func TestRegressShrinkDue(t *testing.T) {
+	const gib = int64(1) << 30
+	named := []struct {
+		pos, last int64
+		pct       int
+		want      bool
+	}{
+		{3 * gib, 3 * gib, 100, false},                         // pos == last never shrinks
+		{3 * gib, gib, 100, true},                              // 3 GiB is > 2 GiB
+		{2 * gib, gib, 100, false},                             // exactly at the threshold
+		{2*gib + 1, gib, 100, true},                            // one byte over
+		{6 * gib, 3 * gib, 100, false},                         // a 3 GiB last size
+		{6*gib + 1, 3 * gib, 100, true},                        //
+		{1 << 62, 1 << 62, 100, false},                         // 2^62*100/100 must not wrap
+		{math.MaxInt64, 1 << 62, 100, false},                   // growth 2^62-1 < 2^62
+		{math.MaxInt64, math.MaxInt64, 100, false},             // pos == last at the maximum
+		{math.MaxInt64, math.MaxInt64 - 1, math.MaxInt, false}, // product needs 128 bits
+		{math.MaxInt64, 1, math.MaxInt, true},                  // growth 2^63-2 > MaxInt/100
+		{math.MaxInt64, 0, math.MaxInt, true},                  // last 0: any growth
+		{1 + int64(math.MaxInt/100), 1, math.MaxInt, false},    // growth == threshold
+		{2 + int64(math.MaxInt/100), 1, math.MaxInt, true},     // growth == threshold+1
+		{gib + 1, gib, 0, true},                                // pct 0: any growth
+		{gib, gib, 0, false},                                   //
+		{gib + 1, gib, -50, true},                              // negative pct acts as 0
+		{gib, gib, -50, false},                                 //
+		{1, 0, 100, true},                                      //
+		{0, 0, 100, false},                                     //
+		{gib - 1, gib, 100, false},                             // the file shrank
+	}
+	for _, c := range named {
+		if got := shrinkDue(c.pos, c.last, c.pct); got != c.want {
+			t.Errorf("shrinkDue(%d, %d, %d) = %v, want %v", c.pos, c.last, c.pct, got, c.want)
+		}
+	}
+	// Exhaustive comparison with exact arithmetic over boundary values.
+	vals := []int64{0, 1, 99, 100, 101, gib, 3 * gib, 1<<31 - 1, 1 << 31, 1<<32 + 1,
+		1 << 40, 1<<62 - 1, 1 << 62, 1<<62 + 1, math.MaxInt64 - 1, math.MaxInt64}
+	pcts := []int{math.MinInt, -1, 0, 1, 50, 99, 100, 101, 200, 201, 1 << 20, math.MaxInt - 1, math.MaxInt}
+	for _, pos := range vals {
+		for _, last := range vals {
+			for _, pct := range pcts {
+				want := false
+				if pos > last && pct > 0 {
+					limit := new(big.Int).Mul(big.NewInt(last), big.NewInt(int64(pct)))
+					limit.Quo(limit, big.NewInt(100))
+					want = new(big.Int).Sub(big.NewInt(pos), big.NewInt(last)).Cmp(limit) > 0
+				} else if pos > last {
+					want = true
+				}
+				if got := shrinkDue(pos, last, pct); got != want {
+					t.Fatalf("shrinkDue(%d, %d, %d) = %v, want %v", pos, last, pct, got, want)
+				}
+			}
+		}
+	}
+}
+
+// C13: load sums the estimated AOF size over every item in estaofsz, then adds
+// it to lastaofsz. One 1 MiB value shared by 3000 keys makes the walk sum to
+// 2.9 GiB in about 1 MiB of memory, which overflows a 32-bit int on 386.
+func TestRegressLoadAccumulatesInt64(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	value := strings.Repeat("x", 1<<20)
+	var want int64
+	for i := range 3000 {
+		item := &dbItem{key: strconv.Itoa(i), val: value}
+		db.keys.Set(item)
+		want += int64(item.estAOFSetSize())
+	}
+	if want <= math.MaxInt32 {
+		t.Fatalf("fixture sums to %d, want more than MaxInt32", want)
+	}
+	if err := db.load(); err != nil { // the file is empty, so only the walk counts
+		t.Fatal(err)
+	}
+	if db.lastaofsz != want {
+		t.Fatalf("lastaofsz = %d, want %d", db.lastaofsz, want)
 	}
 }

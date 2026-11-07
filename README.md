@@ -583,8 +583,10 @@ rollback and retry a non-idempotent operation, or it will be applied twice. A
 write error is never replaced by a later sync result. Subsequent operations
 remain allowed, but a sync failure does not establish that storage is healthy.
 
-Background `EverySecond` sync errors are not surfaced. `Close` continues to
-ignore the error from its final sync.
+Background `EverySecond` sync errors are not surfaced. The background sync
+retries each second until it succeeds. `Close` returns the error from its final
+sync or from closing the file. It releases every resource first, so a failed
+`Close` still leaves the database closed. Earlier versions ignored the sync error.
 
 ## Config
 

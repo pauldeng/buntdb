@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"os"
 	"runtime"
 	"slices"
@@ -79,7 +80,7 @@ type DB struct {
 	config    Config            // the database configuration
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
-	lastaofsz int               // the size of the last shrink aof size
+	lastaofsz int64             // the size of the last shrink aof size
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -178,6 +179,10 @@ func Open(path string) (*DB, error) {
 
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
+// Close syncs the file before closing it.
+// Close releases every resource even when the sync or close fails.
+// Close returns any error from syncing or closing the file.
+// Close returns ErrDatabaseClosed if the database is already closed.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -185,16 +190,15 @@ func (db *DB) Close() error {
 		return ErrDatabaseClosed
 	}
 	db.closed = true
+	var err error
 	if db.persist {
-		db.file.Sync() // do a sync but ignore the error
-		if err := db.file.Close(); err != nil {
-			return err
-		}
+		err = db.file.Sync()
+		err = errors.Join(err, db.file.Close())
 	}
 	// Let's release all references to nil. This will help both with debugging
 	// late usage panics and it provides a hint to the garbage collector
 	db.keys, db.exps, db.idxs, db.file = nil, nil, nil, nil
-	return nil
+	return err
 }
 
 // Save writes a snapshot of the database to a writer. This operation blocks all
@@ -577,11 +581,8 @@ func (db *DB) backgroundManager() {
 				if err != nil {
 					return err
 				}
-				aofsz := int(pos)
-				if aofsz > db.config.AutoShrinkMinSize {
-					prc := float64(db.config.AutoShrinkPercentage) / 100.0
-					shrink = aofsz > db.lastaofsz+int(float64(db.lastaofsz)*prc)
-				}
+				shrink = pos > int64(db.config.AutoShrinkMinSize) &&
+					shrinkDue(pos, db.lastaofsz, db.config.AutoShrinkPercentage)
 			}
 			// produce a list of expired items that need removing
 			btreeAscendLessThan(db.exps, &dbItem{
@@ -627,10 +628,12 @@ func (db *DB) backgroundManager() {
 		func() {
 			db.mu.Lock()
 			defer db.mu.Unlock()
-			if db.persist && db.config.SyncPolicy == EverySecond &&
+			if !db.closed && db.persist && db.config.SyncPolicy == EverySecond &&
 				flushes != db.flushes {
-				_ = db.file.Sync()
-				flushes = db.flushes
+				// Advance only on success, so a failed sync is retried.
+				if db.file.Sync() == nil {
+					flushes = db.flushes
+				}
 			}
 		}()
 		if shrink {
@@ -641,6 +644,24 @@ func (db *DB) backgroundManager() {
 			}
 		}
 	}
+}
+
+// shrinkDue reports whether an aof file of pos bytes is more than pct percent
+// larger than last, the size after the previous shrink. A pct of zero or less
+// means any growth, as does a last of zero. The arithmetic is exact and cannot overflow.
+func shrinkDue(pos, last int64, pct int) bool {
+	if pos <= last {
+		return false
+	}
+	if pct <= 0 || last <= 0 {
+		return true
+	}
+	hi, lo := bits.Mul64(uint64(last), uint64(pct))
+	if hi >= 100 {
+		return false // last*pct/100 exceeds 2^64, so it exceeds any growth
+	}
+	limit, _ := bits.Div64(hi, lo, 100)
+	return uint64(pos-last) > limit
 }
 
 // Shrink will make the database file smaller by removing redundant
@@ -779,7 +800,7 @@ func (db *DB) Shrink() error {
 		if err != nil {
 			return err
 		}
-		db.lastaofsz = int(pos)
+		db.lastaofsz = pos
 		return nil
 	}()
 }
@@ -1100,10 +1121,10 @@ func (db *DB) load() error {
 	if _, err := db.file.Seek(n, 0); err != nil {
 		return err
 	}
-	var estaofsz int
+	var estaofsz int64
 	db.keys.Walk(func(items []interface{}) {
 		for _, v := range items {
-			estaofsz += v.(*dbItem).estAOFSetSize()
+			estaofsz += int64(v.(*dbItem).estAOFSetSize())
 		}
 	})
 	db.lastaofsz += estaofsz
