@@ -461,7 +461,7 @@ func TestRegressLengthBoundaries(t *testing.T) {
 	}
 }
 
-// Upstream issue #125: each crafted input must make Load return an error,
+// Upstream issue #125: each crafted input must make Load return ErrInvalid,
 // never panic, and never succeed silently.
 func TestRegressIssue125(t *testing.T) {
 	for _, tc := range []struct {
@@ -481,13 +481,8 @@ func TestRegressIssue125(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("Load panicked: %v", r)
-				}
-			}()
-			if err := db.Load(strings.NewReader(tc.aof)); err == nil {
-				t.Fatal("Load accepted malformed input")
+			if err := db.Load(strings.NewReader(tc.aof)); err != ErrInvalid {
+				t.Fatalf("Load = %v, want ErrInvalid", err)
 			}
 		})
 	}

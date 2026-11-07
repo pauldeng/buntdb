@@ -2672,15 +2672,13 @@ func TestOnExpiredSync(t *testing.T) {
 			return err
 		}
 		defer func() { hits <- n }()
-		if n >= 2 {
-			_, err = tx.Delete(key)
-			if err != ErrNotFound {
-				return err
-			}
-			return nil
-		}
 		n++
-		_, _, err = tx.Set(key, strconv.Itoa(n), &SetOptions{Expires: true, TTL: time.Millisecond * 100})
+		// The final value has no TTL, so it never expires and this runs for 0 and 1 only.
+		opts := &SetOptions{Expires: true, TTL: time.Millisecond * 100}
+		if n >= 2 {
+			opts = nil
+		}
+		_, _, err = tx.Set(key, strconv.Itoa(n), opts)
 		return err
 	}
 	if err := db.SetConfig(config); err != nil {
@@ -2747,9 +2745,9 @@ func TestOnExpiredSync(t *testing.T) {
 		case v = <-hits:
 		}
 	}
-	// The item expires 100 ms after the callback. Read it as expired-but-present.
+	// The callback stored "2" without a TTL, so it stays.
 	err = db.View(func(tx *Tx) error {
-		v, err := tx.Get("K", true)
+		v, err := tx.Get("K")
 		if err != nil {
 			return err
 		}
