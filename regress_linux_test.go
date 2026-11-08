@@ -448,7 +448,7 @@ func closeInheritedFDsOnExec() {
 type shrinkCase struct {
 	inject  string   // strace -e inject expressions
 	events  string   // strace trace set: must include every call in inject
-	filter  string   // "db": count only calls on s.db; "fd6": only calls on fd 6; "": all calls
+	filter  string   // "db": count only calls on s.db; "fd10": only calls on fd 10; "": all calls
 	hits    []string // a regexp for each injected trace line, in order
 	err     error    // the error Shrink must wrap
 	alsoErr error    // a second error Shrink must wrap, or nil
@@ -462,11 +462,12 @@ type shrinkCase struct {
 // thread has its own history of calls from before the test started. So a
 // when=N that counts every call would depend on which thread the test got.
 // The filter field makes N count only calls on the database file (-P) or on
-// the temp file's fd (6: the child opens 5 for s.db, and ReadFile's fd 6 is
-// closed before Shrink). Those calls all happen in the locked child, after
-// LockOSThread. The parent marks its inherited fds close-on-exec, so those
-// numbers do not move when a caller leaves extra fds open. The parent also checks that each injected line is the
-// intended call, so a miscount fails the test instead of passing it.
+// the temp file's fd (10: just before Shrink, the child fills every lower free
+// fd with a dup3 of stderr, see fillFDsBelow). Those calls all happen in the
+// locked child, after LockOSThread. The parent marks its inherited fds
+// close-on-exec, so a caller's extra fds do not move these numbers. The parent
+// also checks that each injected line is the intended call, so a miscount
+// fails the test instead of passing it.
 func runShrinkCase(t *testing.T, test string, c shrinkCase) {
 	if os.Getenv("BUNTDB_SYNC_TEST_CHILD") != "1" {
 		dir := t.TempDir()
@@ -476,8 +477,8 @@ func runShrinkCase(t *testing.T, test string, c shrinkCase) {
 		switch c.filter {
 		case "db":
 			extra = []string{"-P", filepath.Join(dir, "s.db")}
-		case "fd6":
-			extra = []string{"-e", "trace-fds=6"}
+		case "fd10":
+			extra = []string{"-e", "trace-fds=10"}
 		}
 		trace := runUnderStrace(t, test, c.inject, c.events, extra...)
 		var injected []string
@@ -501,6 +502,9 @@ func runShrinkCase(t *testing.T, test string, c shrinkCase) {
 	db, path, orig := shrinkFixture(t)
 	dir := filepath.Dir(path)
 	state := map[string]string{"a": "2", "b": "3"}
+	if c.filter == "fd10" {
+		fillFDsBelow(t, 10) // so the temp file gets fd 10, whatever the runtime holds
+	}
 
 	if err := db.Shrink(); !errors.Is(err, c.err) || c.alsoErr != nil && !errors.Is(err, c.alsoErr) {
 		t.Fatalf("Shrink = %v, want %v and %v", err, c.err, c.alsoErr)
@@ -553,6 +557,30 @@ func runShrinkCase(t *testing.T, test string, c shrinkCase) {
 	wantKeys(t, reopened, state)
 }
 
+// fillFDsBelow makes every free descriptor below fd a copy of stderr, so the
+// next open gets fd. How many descriptors the runtime holds varies (netpoll,
+// and the cgroup CPU-limit files on some hosts). It uses dup3 and no close,
+// so it adds no close call to the trace.
+func fillFDsBelow(t *testing.T, fd int) {
+	t.Helper()
+	inUse := func(n int) bool {
+		_, _, errno := syscall.RawSyscall(syscall.SYS_FCNTL, uintptr(n), syscall.F_GETFD, 0)
+		return errno == 0
+	}
+	for n := 3; n < fd; n++ {
+		if inUse(n) {
+			continue
+		}
+		if err := syscall.Dup3(2, n, syscall.O_CLOEXEC); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = syscall.Close(n) })
+	}
+	if inUse(fd) {
+		t.Fatalf("fd %d is in use before Shrink", fd)
+	}
+}
+
 func dirNames(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -578,11 +606,12 @@ func TestRegressShrinkTempSyncFails(t *testing.T) {
 	})
 }
 
-// With fd6, the 1st close is ReadFile's in the fixture; the 2nd is the temp file's.
+// With fd10 free and every lower fd filled just before Shrink, the 1st close on
+// fd 10 is the temp file's.
 func TestRegressShrinkTempCloseFails(t *testing.T) {
 	runShrinkCase(t, "TestRegressShrinkTempCloseFails", shrinkCase{
-		inject: "close:error=EIO:when=2", events: "close", filter: "fd6",
-		hits: []string{`^\d+ close\(6<.*/s\.db\.\d+\.tmp>\)`},
+		inject: "close:error=EIO:when=1", events: "close", filter: "fd10",
+		hits: []string{`^\d+ close\(10<.*/s\.db\.\d+\.tmp>\)`},
 		err:  syscall.EIO, open: true, leaks: true,
 	})
 }
