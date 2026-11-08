@@ -4,6 +4,8 @@ package buntdb
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -25,4 +27,24 @@ func syncDir(dir string) error {
 		err = cerr
 	}
 	return err
+}
+
+// absParent splits path into the absolute directory of the file and its base
+// name. It does not clean the directory. The kernel follows a symlink before it
+// applies a "..", so base/link/../db is the file in the parent of link's
+// target. filepath.Abs, Dir and Base would collapse the ".." first and name
+// another file. A relative directory gets the working directory as a prefix.
+func absParent(path string) (dir, base string, err error) {
+	dir, base = ".", path
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		dir, base = path[:i+1], path[i+1:]
+	}
+	if !filepath.IsAbs(dir) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", "", err
+		}
+		dir = wd + "/" + dir
+	}
+	return dir, base, nil
 }

@@ -15,10 +15,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/btree/v2"
@@ -69,14 +69,17 @@ var (
 // DB represents a collection of key-value pairs that persist on disk.
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
-	mu        sync.RWMutex      // the gatekeeper for all fields
+	mu        sync.RWMutex      // the gatekeeper for all fields, except synced
 	file      *os.File          // the underlying file
 	buf       []byte            // a buffer to write to
 	keys      *dbTree           // a tree of all item ordered by key
 	exps      *dbTree           // a tree of items ordered by expiration
 	idxs      map[string]*index // the index trees.
 	insIdxs   []*index          // a reuse buffer for gathering indexes
-	flushes   int               // a count of the number of disk flushes
+	flushes   int64             // a count of the number of disk flushes
+	synced    atomic.Int64      // atomic, not under mu: the largest flushes value acknowledged by a successful file fsync
+	path      string            // the absolute path of the file; its parent is resolved at Open
+	dir       string            // the real directory that holds the file; Sync syncs it. Set at Open, updated when Shrink replaces a symlink
 	closed    bool              // set when the database has been closed
 	config    Config            // the database configuration
 	persist   bool              // do we write to disk
@@ -133,7 +136,7 @@ type Config struct {
 	// OnExpiredSync will be called inside the same transaction that is
 	// performing the deletion of expired items. If OnExpired is present then
 	// this callback will not be called. If this callback is present, then the
-	// deletion of the timeed-out item is the explicit responsibility of this
+	// deletion of the timed-out item is the explicit responsibility of this
 	// callback.
 	OnExpiredSync func(key, value string, tx *Tx) error
 }
@@ -161,12 +164,29 @@ func Open(path string) (*DB, error) {
 	// turn off persistence for pure in-memory
 	db.persist = path != ":memory:"
 	if db.persist {
-		var err error
-		// hardcoding 0666 as the default mode.
-		db.file, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
+		// Fix the path now, so that a later chdir or symlink change cannot
+		// move it. Resolve the parent first, then open through the result.
+		dir, base, err := absParent(path)
 		if err != nil {
 			return nil, err
 		}
+		dir, err = filepath.EvalSymlinks(dir)
+		if err != nil {
+			return nil, err
+		}
+		db.path = filepath.Join(dir, base)
+		// hardcoding 0666 as the default mode.
+		db.file, err = os.OpenFile(db.path, os.O_CREATE|os.O_RDWR, 0666)
+		if err != nil {
+			return nil, err
+		}
+		// A final symlink may lead to another directory, where the file lives.
+		real, err := filepath.EvalSymlinks(db.path)
+		if err != nil {
+			_ = db.file.Close()
+			return nil, err
+		}
+		db.dir = filepath.Dir(real)
 		// load the database from disk
 		if err := db.load(); err != nil {
 			// close on error, ignore close error
@@ -560,12 +580,10 @@ func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 // backgroundManager runs continuously in the background and performs various
 // operations such as removing expired items and syncing to disk.
 func (db *DB) backgroundManager(interval time.Duration) {
-	flushes := 0
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for range t.C {
-		var stop bool
-		if flushes, stop = db.tick(flushes, (*os.File).Sync); stop {
+		if db.tick((*os.File).Sync) {
 			break
 		}
 	}
@@ -576,10 +594,9 @@ func (db *DB) backgroundManager(interval time.Duration) {
 var tickInterval = time.Second
 
 // tick runs one background pass: the expiry sweep, the EverySecond fsync and
-// the auto shrink. flushes is the db.flushes value of the last good background
-// sync; tick returns the new value, and true when the database is closed.
+// the auto shrink. It returns true when the database is closed.
 // syncFile is the fsync; tests pass one that holds or fails.
-func (db *DB) tick(flushes int, syncFile func(*os.File) error) (int, bool) {
+func (db *DB) tick(syncFile func(*os.File) error) bool {
 	// Look first with the read lock, so that a tick with no expired
 	// item does not block readers.
 	var shrink, due bool
@@ -601,7 +618,7 @@ func (db *DB) tick(flushes int, syncFile func(*os.File) error) (int, bool) {
 	}
 	db.mu.RUnlock()
 	if closed {
-		return flushes, true
+		return true
 	}
 	var onExpired func([]string)
 	var expired []*dbItem
@@ -642,7 +659,7 @@ func (db *DB) tick(flushes int, syncFile func(*os.File) error) (int, bool) {
 		})
 	}
 	if err == ErrDatabaseClosed {
-		return flushes, true
+		return true
 	}
 
 	// send expired event, if needed
@@ -657,19 +674,107 @@ func (db *DB) tick(flushes int, syncFile func(*os.File) error) (int, bool) {
 	// Execute a disk sync, if needed. The fsync runs without a lock, so
 	// readers and writers do not wait for it. A concurrent Shrink or Close
 	// may close f, and the sync may then fail. A failed sync does not
-	// advance flushes, so the next tick retries while the database is open.
+	// advance db.synced, so the next tick retries while the database is open.
 	db.mu.RLock()
 	f, n := db.file, db.flushes
 	syncDue := !db.closed && db.persist &&
-		db.config.SyncPolicy == EverySecond && flushes != n
+		db.config.SyncPolicy == EverySecond && db.synced.Load() != n
 	db.mu.RUnlock()
 	if syncDue && syncFile(f) == nil {
-		flushes = n
+		db.ack(n)
 	}
-	if shrink && db.Shrink() == ErrDatabaseClosed {
-		return flushes, true
+	return shrink && db.Shrink() == ErrDatabaseClosed
+}
+
+// ack records that the writes up to flush count n are on disk. The value
+// only grows, so a slow sync cannot undo a later one.
+func (db *DB) ack(n int64) {
+	for {
+		old := db.synced.Load()
+		if old >= n || db.synced.CompareAndSwap(old, n) {
+			return
+		}
 	}
-	return flushes, false
+}
+
+// Sync writes every committed change to disk with an fsync, then syncs the
+// directory that holds the file. Use it with the SyncPolicy Never or
+// EverySecond when you need durability at a known point.
+//
+// When Sync returns nil, every write that committed before the call is in the
+// file on disk, and the directory entry of the file is on disk too. Each Sync
+// costs one file fsync and one directory fsync. The directory is the real
+// parent of the file. Open resolves it, and Shrink updates it when it replaces
+// a symlink with the file. The directory fsync exists on Linux
+// and other Unix systems; on other systems Sync syncs the file only. Sync does
+// not sync the ancestors of that directory; they must already be durable.
+// Close syncs the file, not the directory.
+//
+// If the file fsync succeeds and the directory fsync fails, Sync returns the
+// directory error. The writes are in the file on disk, but the name may not
+// be. The background sync does not repeat the directory fsync. Call Sync again.
+//
+// Call Sync outside a transaction. Inside Update it deadlocks, and inside View
+// it can deadlock when a writer waits. Sync does not block readers or writers
+// while it runs. A write that commits during the fsync may not be on disk. Sync always runs both fsyncs, also when
+// no commit is unacknowledged. It does nothing and returns nil for an
+// in-memory database.
+//
+// Sync returns ErrDatabaseClosed if the database is closed before the call, or
+// if Close finishes before the file fsync starts. If Shrink replaces the file
+// before the file fsync starts, Sync syncs the new file. It makes at most
+// three file fsync attempts, then returns the last error, or ErrDatabaseClosed
+// if the database is closed by then. If Close starts while the file fsync runs,
+// that fsync finishes and Sync returns its result, or the directory error.
+//
+// The database tracks the sync work conservatively, as acknowledged commit
+// counts. Each file fsync attempt reads the commit count just before it starts.
+// If the fsync succeeds, it acknowledges that count. A write that commits after
+// that read is not acknowledged by that attempt. After a retry, the call can
+// acknowledge a write that committed during the call. A concurrent Sync may
+// acknowledge a write that another call did not. A successful Shrink and an
+// Always fsync acknowledge nothing, so the background sync can still fsync once
+// for writes that are already on disk. With SyncPolicy EverySecond, the
+// background sync fsyncs the file while a commit is unacknowledged. If the file
+// fsync of Sync fails, it acknowledges nothing, so the next background sync
+// tries again. If every commit is acknowledged, a failed Sync is not retried.
+func (db *DB) Sync() error { return db.syncWith((*os.File).Sync) }
+
+// syncAttempts is the most file fsync attempts that Sync makes when Close or
+// Shrink closes the file under it.
+const syncAttempts = 3
+
+// syncWith is Sync with the file fsync as a parameter; tests pass one that holds.
+func (db *DB) syncWith(syncFile func(*os.File) error) error {
+	for attempt := 1; ; attempt++ {
+		db.mu.RLock()
+		closed, persist, f, dir, n := db.closed, db.persist, db.file, db.dir, db.flushes
+		db.mu.RUnlock()
+		if closed {
+			return ErrDatabaseClosed
+		}
+		if !persist {
+			return nil
+		}
+		err := syncFile(f)
+		if err == nil {
+			db.ack(n) // the file is durable, whatever the directory sync does
+			return syncDir(dir)
+		}
+		if !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+		// Close or Shrink closed f before the fsync. Look at the state again.
+		if attempt == syncAttempts {
+			db.mu.RLock()
+			closed = db.closed
+			db.mu.RUnlock()
+			if closed {
+				return ErrDatabaseClosed
+			}
+			return err
+		}
+	}
 }
 
 // shrinkDue reports whether an aof file of pos bytes is more than pct percent
@@ -732,7 +837,7 @@ func (db *DB) Shrink() error {
 		db.shrinking = false
 		db.mu.Unlock()
 	}()
-	fname := db.file.Name()
+	fname := db.path
 	// the endpos is used to return to the end of the file when we are
 	// finished writing all of the current items.
 	endpos, err := db.file.Seek(0, io.SeekEnd)
@@ -857,7 +962,10 @@ func (db *DB) Shrink() error {
 		db.lastaofsz = pos
 		// The rename is durable only after the directory is synced. The
 		// database is already using the new file, so it stays open.
-		return syncDir(filepath.Dir(fname))
+		// Shrink may have replaced a symlink with the file, so the file now
+		// lives in the directory of fname.
+		db.dir = filepath.Dir(fname)
+		return syncDir(db.dir)
 	}()
 }
 
@@ -1782,7 +1890,7 @@ func (idx *index) lessItems(a, b *dbItem) bool {
 
 // Rect converts a string to a rectangle.
 // An invalid rectangle will cause a panic.
-func (dbi *dbItem) Rect(ctx interface{}) (min, max []float64) {
+func (dbi *dbItem) Rect(ctx any) (min, max []float64) {
 	switch ctx := ctx.(type) {
 	case *index:
 		return ctx.rect(dbi.val)
@@ -2271,7 +2379,7 @@ type rect struct {
 	min, max []float64
 }
 
-func (r *rect) Rect(ctx interface{}) (min, max []float64) {
+func (r *rect) Rect(ctx any) (min, max []float64) {
 	return r.min, r.max
 }
 
@@ -2589,7 +2697,7 @@ func (tx *Tx) Indexes() ([]string, error) {
 	for name := range tx.db.idxs {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names, nil
 }
 

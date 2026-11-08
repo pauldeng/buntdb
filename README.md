@@ -632,6 +632,66 @@ retries each second until it succeeds. `Close` returns the error from its final
 sync or from closing the file. It releases every resource first, so a failed
 `Close` still leaves the database closed. Earlier versions ignored the sync error.
 
+#### Sync at a known point
+
+`DB.Sync()` runs an `fsync` on the aof file now, and then on the directory that holds the file.
+Use it with the `Never` or `EverySecond` policy when you need durability at a known point.
+When `Sync` returns nil, every write that committed before the call is in the file on disk.
+The directory entry of the file is on disk too.
+
+```go
+err := db.Update(func(tx *buntdb.Tx) error {
+	_, _, err := tx.Set("key", "value", nil)
+	return err
+})
+if err == nil {
+	err = db.Sync() // call Sync after the transaction, never inside it
+}
+```
+
+Call `Sync` outside a transaction.
+Inside `Update` it deadlocks.
+Inside `View` it can deadlock when a writer waits.
+`Sync` does not block readers or writers while it runs.
+A write that commits during the `Sync` may not be on disk.
+
+Each `Sync` costs one file fsync and one directory fsync.
+`Sync` always runs both, also when no commit is unacknowledged.
+The directory is the real parent of the file.
+`Open` resolves it, and `Shrink` updates it when it replaces a symlink with the file.
+A later change of the working directory does not move it.
+The directory fsync exists on Linux and other Unix systems.
+On other systems, `Sync` syncs the file only.
+`Sync` does not sync the parents of that directory.
+Those directories must already be durable.
+`Close` syncs the file, not the directory.
+`Sync` does nothing and returns nil for an in-memory database.
+
+If the file fsync succeeds and the directory fsync fails, `Sync` returns the directory error.
+The writes are then in the file on disk, but the name may not be.
+The background sync does not repeat the directory fsync.
+Call `Sync` again.
+
+`Sync` returns `ErrDatabaseClosed` if the database is closed before the call.
+It also returns `ErrDatabaseClosed` if `Close` finishes before the file fsync starts.
+If `Shrink` replaces the file before the file fsync starts, `Sync` syncs the new file.
+`Sync` makes at most three file fsync attempts, then returns the last error.
+It returns `ErrDatabaseClosed` instead if the database is closed by then.
+If `Close` starts while the file fsync runs, that fsync finishes.
+`Sync` then returns the result of that fsync, or the directory error.
+
+The database tracks the sync work conservatively, as acknowledged commit counts.
+Each file fsync attempt reads the commit count just before it starts.
+If the fsync succeeds, it acknowledges that count.
+A write that commits after that read is not acknowledged by that attempt.
+After a retry, the call can acknowledge a write that committed during the call.
+A concurrent `Sync` may acknowledge a write that another call did not.
+A successful `Shrink` and an `Always` fsync acknowledge nothing.
+The background sync can then fsync once for writes that are already on disk.
+With `EverySecond`, the background sync runs the file fsync while a commit is unacknowledged.
+If the file fsync of `Sync` fails, it acknowledges nothing, so the background sync tries again.
+If every commit is acknowledged, a failed `Sync` is not retried.
+
 ## Config
 
 Here are some configuration options that can be use to change various behaviors of the database.

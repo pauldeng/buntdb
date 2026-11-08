@@ -119,6 +119,9 @@ func joinStraceLines(trace string) []string {
 	for _, line := range strings.Split(trace, "\n") {
 		line = strings.TrimLeft(line, " ") // strace pads pids to a common width
 		pid, rest, _ := strings.Cut(line, " ")
+		if rest = strings.TrimLeft(rest, " "); rest != "" { // some strace versions pad after the pid too
+			line = pid + " " + rest
+		}
 		if i := strings.Index(rest, "<unfinished ...>"); i >= 0 {
 			pending[pid] = pid + " " + strings.TrimRight(rest[:i], " ")
 			continue
@@ -142,12 +145,14 @@ func TestJoinStraceLines(t *testing.T) {
 		"10 <... fsync resumed>)        = -1 EIO (INJECTED)\n" +
 		"10 fsync(3)                    = 0\n" +
 		"  9 fsync(3 <unfinished ...>\n" + // padded pid, as strace prints it
-		" 9 <... fsync resumed>)         = 0\n"
+		" 9 <... fsync resumed>)         = 0\n" +
+		"12345  fsync(3)                = 0\n" // padding after the pid
 	want := []string{
 		"11 unlinkat(AT_FDCWD, \"x\", 0) = -1 ENOENT",
 		"10 fsync(3)        = -1 EIO (INJECTED)",
 		"10 fsync(3)                    = 0",
 		"9 fsync(3)         = 0",
+		"12345 fsync(3)                = 0",
 	}
 	if got := joinStraceLines(trace); !slices.Equal(got, want) {
 		t.Errorf("joinStraceLines = %q, want %q", got, want)
@@ -284,9 +289,8 @@ func TestRegressBackgroundSyncRetried(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	flushes := 0
 	for range 5 { // five background ticks, no new writes
-		flushes, _ = db.tick(flushes, (*os.File).Sync)
+		db.tick((*os.File).Sync)
 	}
 	_ = os.Remove(filepath.Join(dir, marker)) // the marker shows up in the trace
 	if err := db.Close(); err != nil && !errors.Is(err, syscall.EIO) {
@@ -939,4 +943,315 @@ func TestRegressShrinkACLRemoveFailureAborts(t *testing.T) {
 		hits: []string{`getxattr\(`, `removexattr\(`},
 		err:  syscall.EACCES, open: true,
 	})
+}
+
+// syncKinds splits the fsyncs of a trace at the marker calls, which remove the
+// files m1, m2, and so on. It returns the fsyncs before each marker: "file" for
+// dir/tick.db, "tmp" for a Shrink temp file of it and "dir" for dir itself,
+// each with "!" appended when strace injected the error. Any other target is
+// reported as "other <path>", so an fsync of the wrong directory shows up.
+func syncKinds(t *testing.T, trace, dir string, markers int) [][]string {
+	t.Helper()
+	markerCall := regexp.MustCompile(`/m[1-9]", 0\)`) // os.Remove also issues an AT_REMOVEDIR call
+	target := regexp.MustCompile(`fsync\(\d+<([^>]*)>`)
+	file := filepath.Join(dir, "tick.db")
+	var segs [][]string
+	var cur []string
+	for _, line := range joinStraceLines(trace) {
+		if markerCall.MatchString(line) {
+			segs = append(segs, cur)
+			cur = nil
+			continue
+		}
+		m := target.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		kind := "other " + m[1]
+		switch {
+		case m[1] == dir:
+			kind = "dir"
+		case m[1] == file:
+			kind = "file"
+		case strings.HasPrefix(m[1], file+".") && strings.HasSuffix(m[1], ".tmp"):
+			kind = "tmp"
+		}
+		if strings.Contains(line, "(INJECTED)") {
+			kind += "!"
+		}
+		cur = append(cur, kind)
+	}
+	if len(segs) != markers {
+		t.Fatalf("got %d markers, want %d:\n%s", len(segs), markers, trace)
+	}
+	return segs
+}
+
+// syncParent runs the named test as a strace child whose database directory is
+// a new temp dir, given to the child in BUNTDB_SYNC_DIR. It returns the real
+// path of that directory, as strace prints it, and the fsyncs between markers.
+func syncParent(t *testing.T, test, inject string, markers int) (string, [][]string) {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BUNTDB_SYNC_DIR", dir)
+	trace := runUnderStrace(t, test, inject, "fsync,unlinkat")
+	return dir, syncKinds(t, trace, dir, markers)
+}
+
+// syncChild opens the database at path in a strace child, on a locked thread,
+// so that strace counts the fsyncs of the test in order. Marker files are
+// removed in the directory markerDir.
+func syncChild(t *testing.T, path, markerDir string) (db *DB, marker func(int), set func(string)) {
+	runtime.LockOSThread()
+	t.Cleanup(runtime.UnlockOSThread)
+	old := tickInterval
+	tickInterval = 0
+	db, err := Open(path)
+	tickInterval = old
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.SetConfig(Config{SyncPolicy: EverySecond, AutoShrinkDisabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	marker = func(n int) { _ = os.Remove(filepath.Join(markerDir, "m"+strconv.Itoa(n))) }
+	set = func(key string) {
+		t.Helper()
+		if err := setTTLKey(db, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return
+}
+
+func wantKinds(t *testing.T, got, want [][]string) {
+	t.Helper()
+	for i := range want {
+		if !slices.Equal(got[i], want[i]) {
+			t.Errorf("fsyncs before marker m%d = %q, want %q", i+1, got[i], want[i])
+		}
+	}
+}
+
+// S1: DB.Sync against real fsyncs. The child runs on one locked thread, so
+// strace injects EIO into its first fsync only. It removes the files m1 to m5
+// as markers; the parent lists the fsyncs between them:
+//
+//	before m1: Sync fails with EIO (the injected fsync; no directory sync follows)
+//	m1..m2:    the tick retries the failed sync
+//	m2..m3:    an idle tick does nothing
+//	m3..m4:    Sync syncs the file and the directory, and the tick after it does nothing
+//	m4..m5:    a new write makes the tick sync again
+func TestRegressDBSyncStrace(t *testing.T) {
+	if dir := os.Getenv("BUNTDB_SYNC_DIR"); os.Getenv("BUNTDB_SYNC_TEST_CHILD") == "1" {
+		db, marker, set := syncChild(t, filepath.Join(dir, "tick.db"), dir)
+		set("k1")
+		if err := db.Sync(); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("Sync = %v, want the injected EIO", err)
+		}
+		marker(1)
+		db.tick((*os.File).Sync) // retries
+		marker(2)
+		db.tick((*os.File).Sync) // idle
+		marker(3)
+		set("k2")
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		db.tick((*os.File).Sync) // nothing to sync after Sync
+		marker(4)
+		set("k3")
+		db.tick((*os.File).Sync)
+		marker(5)
+		return
+	}
+	_, got := syncParent(t, "TestRegressDBSyncStrace", "fsync:error=EIO:when=1", 5)
+	wantKinds(t, got, [][]string{{"file!"}, {"file"}, nil, {"file", "dir"}, {"file"}})
+}
+
+// S1: the second fsync, the directory's, fails. Sync returns the error. The
+// file fsync was good, so the tick has nothing to do. The next Sync syncs both
+// again.
+func TestRegressDBSyncDirStrace(t *testing.T) {
+	if dir := os.Getenv("BUNTDB_SYNC_DIR"); os.Getenv("BUNTDB_SYNC_TEST_CHILD") == "1" {
+		db, marker, set := syncChild(t, filepath.Join(dir, "tick.db"), dir)
+		set("k")
+		if err := db.Sync(); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("Sync = %v, want the injected directory EIO", err)
+		}
+		marker(1)
+		db.tick((*os.File).Sync)
+		marker(2)
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		marker(3)
+		return
+	}
+	_, got := syncParent(t, "TestRegressDBSyncDirStrace", "fsync:error=EIO:when=2", 3)
+	wantKinds(t, got, [][]string{{"file", "dir!"}, nil, {"file", "dir"}})
+}
+
+// S1: Sync syncs the directory found at Open, not the one that "." or the
+// path names later. The database path is relative, and the process changes its
+// working directory after Open.
+func TestRegressDBSyncAfterChdir(t *testing.T) {
+	if dir := os.Getenv("BUNTDB_SYNC_DIR"); os.Getenv("BUNTDB_SYNC_TEST_CHILD") == "1" {
+		t.Chdir(dir)
+		db, marker, set := syncChild(t, "tick.db", dir)
+		set("k")
+		t.Chdir(t.TempDir())
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		marker(1)
+		return
+	}
+	_, got := syncParent(t, "TestRegressDBSyncAfterChdir", "", 1)
+	wantKinds(t, got, [][]string{{"file", "dir"}})
+}
+
+// S1: the database path is a dangling symlink in one directory, and Open
+// creates its target in another. The target directory is the one to sync.
+func TestRegressDBSyncSymlinkedPath(t *testing.T) {
+	if dir := os.Getenv("BUNTDB_SYNC_DIR"); os.Getenv("BUNTDB_SYNC_TEST_CHILD") == "1" {
+		link := filepath.Join(t.TempDir(), "link.db")
+		if err := os.Symlink(filepath.Join(dir, "tick.db"), link); err != nil {
+			t.Fatal(err)
+		}
+		db, marker, set := syncChild(t, link, dir)
+		set("k")
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		marker(1)
+		return
+	}
+	_, got := syncParent(t, "TestRegressDBSyncSymlinkedPath", "", 1)
+	wantKinds(t, got, [][]string{{"file", "dir"}})
+}
+
+// S1: "link/../tick.db" with link -> A/sub is A/tick.db. The cleaned path,
+// root/tick.db, is another file and exists. The directory fsync names A.
+func TestRegressDBSyncDotDotAfterSymlink(t *testing.T) {
+	if dir := os.Getenv("BUNTDB_SYNC_DIR"); os.Getenv("BUNTDB_SYNC_TEST_CHILD") == "1" {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "sub"), 0777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(dir, "sub"), filepath.Join(root, "link")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "tick.db"), nil, 0666); err != nil {
+			t.Fatal(err)
+		}
+		db, marker, set := syncChild(t, root+"/link/../tick.db", dir) // Join would clean the ".."
+		set("k")
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		marker(1)
+		return
+	}
+	_, got := syncParent(t, "TestRegressDBSyncDotDotAfterSymlink", "", 1)
+	wantKinds(t, got, [][]string{{"file", "dir"}})
+}
+
+// S1: Sync fsyncs the file and the directory with no commit at all, on a new
+// database and on a reopened one. Close fsyncs the file only.
+func TestRegressDBSyncCleanStrace(t *testing.T) {
+	if dir := os.Getenv("BUNTDB_SYNC_DIR"); os.Getenv("BUNTDB_SYNC_TEST_CHILD") == "1" {
+		path := filepath.Join(dir, "tick.db")
+		db, marker, set := syncChild(t, path, dir)
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		marker(1)
+		set("k")
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		marker(2)
+		old := tickInterval
+		tickInterval = 0
+		db2, err := Open(path)
+		tickInterval = old
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db2.Close()
+		if err := db2.Sync(); err != nil { // no commit since the reopen
+			t.Fatal(err)
+		}
+		marker(3)
+		return
+	}
+	_, got := syncParent(t, "TestRegressDBSyncCleanStrace", "", 3)
+	wantKinds(t, got, [][]string{{"file", "dir"}, {"file"}, {"file", "dir"}})
+}
+
+// S1: Close starts while an fsync is already running. Control keeps the file
+// reference for the callback, as a running fsync does. Close finishes, and
+// Sync still returns the result of its own fsync, success or failure.
+func TestRegressDBSyncCloseDuringFsync(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fsyncErr error
+	}{{"success", nil}, {"failure", syscall.EIO}} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := manualTickDB(t, true)
+			if err := setTTLKey(db, "a"); err != nil {
+				t.Fatal(err)
+			}
+			h := newHeldSync(t)
+			inflight := func(f *os.File) error {
+				rc, err := f.SyscallConn()
+				if err != nil {
+					return err
+				}
+				var ferr error
+				if err := rc.Control(func(fd uintptr) {
+					select {
+					case h.entered <- struct{}{}:
+					case <-h.cancel:
+						ferr = errors.New("cancelled")
+						return
+					}
+					select {
+					case <-h.release:
+					case <-h.cancel:
+						ferr = errors.New("cancelled")
+						return
+					}
+					if ferr = tc.fsyncErr; ferr == nil {
+						ferr = syscall.Fsync(int(fd))
+					}
+				}); err != nil {
+					return err
+				}
+				return ferr
+			}
+			res := h.run(func() error { return db.syncWith(inflight) })
+			h.enter(t) // the fsync holds the file
+			h.within(t, "Close during the running fsync", db.Close)
+			h.release <- nil
+			var err error
+			select {
+			case err = <-res:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Sync did not return")
+			}
+			if tc.fsyncErr == nil {
+				if err != nil || db.synced.Load() != db.flushes {
+					t.Fatalf("Sync = %v, synced = %d; want nil and %d: the result of the running fsync", err, db.synced.Load(), db.flushes)
+				}
+			} else if !errors.Is(err, tc.fsyncErr) || db.synced.Load() != 0 {
+				t.Fatalf("Sync = %v, synced = %d; want the fsync error and 0", err, db.synced.Load())
+			}
+		})
+	}
 }

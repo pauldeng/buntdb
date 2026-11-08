@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -2504,9 +2505,8 @@ func TestRegressTickDoesNotBlockReaders(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var flushes int
 			noSync := func(*os.File) error { return nil } // no storage stalls in the timing
-			tick := goErr(func() error { flushes, _ = db.tick(0, noSync); return nil })
+			tick := goErr(func() error { db.tick(noSync); return nil })
 			ok := awaitErr(t, tick, 2*time.Second, "tick during a read transaction")
 			if err := held.Rollback(); err != nil {
 				t.Fatal(err)
@@ -2515,8 +2515,8 @@ func TestRegressTickDoesNotBlockReaders(t *testing.T) {
 				awaitErr(t, tick, 10*time.Second, "tick after rollback") // join the worker
 				return
 			}
-			if want := map[bool]int{false: 0, true: db.flushes}[persist]; flushes != want {
-				t.Fatalf("tick returned flushes %d, want %d", flushes, want)
+			if want := map[bool]int64{false: 0, true: db.flushes}[persist]; db.synced.Load() != want {
+				t.Fatalf("tick acknowledged %d, want %d", db.synced.Load(), want)
 			}
 			if err := db.View(func(tx *Tx) error { _, err := tx.Get("key"); return err }); err != nil {
 				t.Fatalf("the key was swept: %v", err)
@@ -2533,115 +2533,86 @@ func TestRegressTickSyncWithoutLock(t *testing.T) {
 	if err := db.SetConfig(Config{SyncPolicy: EverySecond, AutoShrinkDisabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	entered := make(chan struct{})
-	release := make(chan error)
-	cancel := make(chan struct{})    // closed by cleanup, so a held sync never blocks it
-	hold := func(f *os.File) error { // a sync that waits for the test
-		select {
-		case entered <- struct{}{}:
-		case <-cancel:
-			return errors.New("cancelled")
-		}
-		select {
-		case err := <-release:
-			if err != nil {
-				return err
-			}
-			return f.Sync()
-		case <-cancel:
-			return errors.New("cancelled")
-		}
-	}
-	type result struct {
-		flushes int
-		stop    bool
-	}
-	var pending chan result // the tick in progress; joined in cleanup
-	t.Cleanup(func() {
-		close(cancel)
-		if pending != nil {
-			<-pending
-		}
-	})
-	startTick := func(flushes int) {
-		ch := make(chan result, 1)
-		go func() { f, s := db.tick(flushes, hold); ch <- result{f, s} }()
+	h := newHeldSync(t)
+	var pending chan bool // the tick in progress, with its stop result
+	startTick := func() {
+		ch := make(chan bool, 1)
+		h.run(func() error { ch <- db.tick(h.sync); return nil })
 		pending = ch
 	}
 	enter := func() {
 		t.Helper()
 		select {
-		case <-entered:
-		case r := <-pending:
+		case <-h.entered:
+		case stop := <-pending:
 			pending = nil
-			t.Fatalf("tick returned %+v without an fsync", r)
+			t.Fatalf("tick returned stop=%v without an fsync", stop)
 		case <-time.After(5 * time.Second):
 			t.Fatal("background fsync was not called")
 		}
 	}
-	finish := func(syncErr error) result {
+	finish := func(syncErr error) bool {
 		t.Helper()
-		release <- syncErr
+		h.release <- syncErr
 		select {
-		case r := <-pending:
+		case stop := <-pending:
 			pending = nil
-			return r
+			return stop
 		case <-time.After(5 * time.Second):
 			t.Fatal("tick did not return")
-			return result{}
+			return false
 		}
 	}
 	// during runs fn while the fsync is held, and joins it after the release.
-	during := func(what string, fn func() error, syncErr error) result {
+	during := func(what string, fn func() error, syncErr error) bool {
 		t.Helper()
-		ch := goErr(fn)
+		ch := h.run(fn)
 		ok := awaitErr(t, ch, 2*time.Second, what+" during fsync")
-		r := finish(syncErr)
+		stop := finish(syncErr)
 		if !ok {
 			awaitErr(t, ch, 10*time.Second, what+" after fsync")
 		}
-		return r
+		return stop
 	}
-
+	synced := func() int64 { return db.synced.Load() }
 	if err := setTTLKey(db, "a"); err != nil {
 		t.Fatal(err)
 	}
 	before := db.flushes
-	startTick(0)
+	startTick()
 	enter()
-	r := during("Update and View", func() error {
+	stop := during("Update and View", func() error {
 		if err := setTTLKey(db, "b"); err != nil {
 			return err
 		}
 		return db.View(func(*Tx) error { return nil })
 	}, nil)
-	if r.flushes != before || r.stop {
-		t.Fatalf("tick = %+v, want flushes %d (the write during fsync is not acknowledged)", r, before)
+	if synced() != before || stop {
+		t.Fatalf("tick stop=%v synced=%d, want %d (the write during fsync is not acknowledged)", stop, synced(), before)
 	}
 
 	// The write during the fsync makes the next tick sync again. It fails.
-	startTick(r.flushes)
+	startTick()
 	enter()
-	if r2 := finish(errors.New("injected")); r2.flushes != r.flushes || r2.stop {
-		t.Fatalf("failed sync: tick = %+v, want flushes %d", r2, r.flushes)
+	if stop := finish(errors.New("injected")); synced() != before || stop {
+		t.Fatalf("failed sync: stop=%v synced=%d, want %d", stop, synced(), before)
 	}
 	// The retry succeeds and acknowledges every write.
-	startTick(r.flushes)
+	startTick()
 	enter()
-	r = finish(nil)
-	if r.flushes != db.flushes || r.stop {
-		t.Fatalf("retry: tick = %+v, want flushes %d", r, db.flushes)
+	if stop := finish(nil); synced() != db.flushes || stop {
+		t.Fatalf("retry: stop=%v synced=%d, want %d", stop, synced(), db.flushes)
 	}
 	// Clean: no write since the last good sync, so no fsync.
-	startTick(r.flushes)
+	startTick()
 	select {
-	case <-entered:
-		release <- nil
+	case <-h.entered:
+		h.release <- nil
 		t.Fatal("tick synced a clean database")
-	case r2 := <-pending:
+	case stop := <-pending:
 		pending = nil
-		if r2.flushes != r.flushes || r2.stop {
-			t.Fatalf("clean tick = %+v, want flushes %d", r2, r.flushes)
+		if synced() != db.flushes || stop {
+			t.Fatalf("clean tick stop=%v synced=%d, want %d", stop, synced(), db.flushes)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("clean tick did not return")
@@ -2653,21 +2624,22 @@ func TestRegressTickSyncWithoutLock(t *testing.T) {
 	if err := setTTLKey(db, "c"); err != nil {
 		t.Fatal(err)
 	}
-	startTick(r.flushes)
+	old := synced()
+	startTick()
 	enter()
-	r2 := during("Shrink and Update", func() error {
+	stop = during("Shrink and Update", func() error {
 		if err := db.Shrink(); err != nil {
 			return err
 		}
 		return setTTLKey(db, "d")
 	}, nil)
-	if r2.flushes != r.flushes || r2.stop {
-		t.Fatalf("sync on the replaced file: tick = %+v, want flushes %d", r2, r.flushes)
+	if synced() != old || stop {
+		t.Fatalf("sync on the replaced file: stop=%v synced=%d, want %d", stop, synced(), old)
 	}
-	startTick(r2.flushes)
+	startTick()
 	enter()
-	if r3 := finish(nil); r3.flushes != db.flushes || r3.stop {
-		t.Fatalf("sync on the new file: tick = %+v, want flushes %d", r3, db.flushes)
+	if stop := finish(nil); synced() != db.flushes || stop {
+		t.Fatalf("sync on the new file: stop=%v synced=%d, want %d", stop, synced(), db.flushes)
 	}
 
 	// Close finishes during a held fsync. The sync on the closed file fails,
@@ -2675,13 +2647,387 @@ func TestRegressTickSyncWithoutLock(t *testing.T) {
 	if err := setTTLKey(db, "e"); err != nil {
 		t.Fatal(err)
 	}
-	flushes := db.flushes - 1
-	startTick(flushes)
+	old = synced()
+	startTick()
 	enter()
-	if r4 := during("Close", db.Close, nil); r4.flushes != flushes || r4.stop {
-		t.Fatalf("sync on the closed file: tick = %+v, want flushes %d", r4, flushes)
+	if stop := during("Close", db.Close, nil); synced() != old || stop {
+		t.Fatalf("sync on the closed file: stop=%v synced=%d, want %d", stop, synced(), old)
 	}
-	if _, stop := db.tick(flushes, hold); !stop {
+	if !db.tick(h.sync) {
 		t.Fatal("tick after Close did not stop")
+	}
+}
+
+// heldSync is an fsync that waits for the test. Each call sends on entered,
+// then waits for a value on release: nil syncs the file, an error fails.
+// Cleanup closes cancel, which frees every held fsync, and then joins every
+// worker that run started. A failed test never leaves a worker running.
+// Create it after manualTickDB: cleanups run last in, first out, so the join
+// happens before the database closes.
+type heldSync struct {
+	entered chan struct{}
+	release chan error
+	cancel  chan struct{}
+	wg      sync.WaitGroup
+}
+
+func newHeldSync(t *testing.T) *heldSync {
+	h := &heldSync{entered: make(chan struct{}), release: make(chan error), cancel: make(chan struct{})}
+	t.Cleanup(func() {
+		close(h.cancel)
+		h.wg.Wait()
+	})
+	return h
+}
+
+// run starts fn in a worker that cleanup joins, and returns its result.
+func (h *heldSync) run(fn func() error) chan error {
+	ch := make(chan error, 1)
+	h.wg.Go(func() { ch <- fn() })
+	return ch
+}
+
+func (h *heldSync) sync(f *os.File) error {
+	select {
+	case h.entered <- struct{}{}:
+	case <-h.cancel:
+		return errors.New("cancelled")
+	}
+	select {
+	case err := <-h.release:
+		if err != nil {
+			return err
+		}
+		return f.Sync()
+	case <-h.cancel:
+		return errors.New("cancelled")
+	}
+}
+
+func (h *heldSync) enter(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fsync was not called")
+	}
+}
+
+// within runs fn during a held fsync. It ends the test if fn does not finish
+// in 2 s, as it does when the fsync holds a lock that fn needs.
+func (h *heldSync) within(t *testing.T, what string, fn func() error) {
+	t.Helper()
+	if !awaitErr(t, h.run(fn), 2*time.Second, what) {
+		t.FailNow()
+	}
+}
+
+// countSync returns an fsync that counts its calls and syncs the file.
+func countSync(calls *int) func(*os.File) error {
+	return func(f *os.File) error { *calls++; return f.Sync() }
+}
+
+// S1: DB.Sync. The fsync runs without a lock, acknowledges only the writes
+// made before it, and copes with Close and Shrink. The strace cases are in
+// TestRegressDBSyncStrace and TestRegressDBSyncCloseDuringFsync.
+func TestRegressDBSync(t *testing.T) {
+	t.Run("closed", func(t *testing.T) {
+		for _, path := range []string{":memory:", filepath.Join(t.TempDir(), "s.db")} {
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(); err != ErrDatabaseClosed {
+				t.Errorf("Sync on closed %q = %v, want ErrDatabaseClosed", path, err)
+			}
+		}
+	})
+	t.Run("memory", func(t *testing.T) {
+		db := manualTickDB(t, false)
+		if err := setTTLKey(db, "k"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(); err != nil {
+			t.Fatalf("Sync on :memory: = %v, want nil", err)
+		}
+	})
+	// A content control only: the second Open reads the page cache, so it
+	// passes even if Sync does nothing. TestRegressDBSyncStrace checks the fsync.
+	t.Run("reopen content control", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := db.SetConfig(Config{SyncPolicy: Never, AutoShrinkDisabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := setTTLKey(db, "k"); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		// Open the file again while the first handle is still open.
+		db2, err := Open(db.file.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db2.Close()
+		if err := db2.View(func(tx *Tx) error { _, err := tx.Get("k"); return err }); err != nil {
+			t.Fatalf("reopened database lost k: %v", err)
+		}
+	})
+	t.Run("clean database still syncs", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		calls := 0
+		for i := range 2 { // no write at all
+			if err := db.syncWith(countSync(&calls)); err != nil {
+				t.Fatal(err)
+			}
+			if calls != i+1 {
+				t.Fatalf("clean Sync %d ran %d fsyncs in all, want %d", i+1, calls, i+1)
+			}
+		}
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 { // a write, a Sync, then a Sync with nothing outstanding
+			if err := db.syncWith(countSync(&calls)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if calls != 4 {
+			t.Fatalf("fsync calls = %d, want 4 (Sync does not skip a clean database)", calls)
+		}
+	})
+	t.Run("no lock during fsync", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		before := db.flushes
+		h := newHeldSync(t)
+		res := h.run(func() error { return db.syncWith(h.sync) })
+		h.enter(t)
+		h.within(t, "Update and View during Sync", func() error {
+			if err := setTTLKey(db, "b"); err != nil {
+				return err
+			}
+			return db.View(func(*Tx) error { return nil })
+		})
+		h.release <- nil
+		awaitErr(t, res, 5*time.Second, "Sync")
+		if got := db.synced.Load(); got != before {
+			t.Fatalf("synced = %d, want %d (the write during the fsync is not acknowledged)", got, before)
+		}
+	})
+	t.Run("acknowledged count only grows", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := db.SetConfig(Config{SyncPolicy: EverySecond, AutoShrinkDisabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		old := db.flushes
+		h := newHeldSync(t)
+		tick := h.run(func() error { db.tick(h.sync); return nil })
+		h.enter(t) // the tick holds the count of "a"
+		h.within(t, "Update during the tick's fsync", func() error { return setTTLKey(db, "b") })
+		h.within(t, "Sync during the tick's fsync", db.Sync) // acknowledges "b", a later count
+		h.release <- nil
+		awaitErr(t, tick, 5*time.Second, "tick")
+		if got := db.synced.Load(); got != db.flushes || got <= old {
+			t.Fatalf("synced = %d, want %d (the slow tick must not lower it)", got, db.flushes)
+		}
+	})
+	t.Run("close before fsync", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		h := newHeldSync(t)
+		res := h.run(func() error { return db.syncWith(h.sync) })
+		h.enter(t) // Sync has read the file, and its fsync has not run
+		h.within(t, "Close during Sync", db.Close)
+		h.release <- nil // the fsync now runs on the closed file
+		select {
+		case err := <-res:
+			if err != ErrDatabaseClosed {
+				t.Fatalf("Sync raced by Close = %v, want ErrDatabaseClosed", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Sync did not return")
+		}
+		if got := db.synced.Load(); got != 0 {
+			t.Fatalf("synced = %d after a failed Sync, want 0", got)
+		}
+	})
+	t.Run("shrink before fsync", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		h := newHeldSync(t)
+		res := h.run(func() error { return db.syncWith(h.sync) })
+		h.enter(t)
+		h.within(t, "Shrink during Sync", db.Shrink)
+		h.release <- nil // fails: Shrink closed the old file
+		h.enter(t)       // Sync looks again and syncs the new file
+		h.release <- nil
+		awaitErr(t, res, 5*time.Second, "Sync raced by Shrink")
+		if got := db.synced.Load(); got != db.flushes {
+			t.Fatalf("synced = %d, want %d", got, db.flushes)
+		}
+	})
+	t.Run("retries are bounded", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		h := newHeldSync(t) // joins the Shrink workers
+		// Every attempt finds its file replaced by a Shrink before the fsync.
+		calls := 0
+		err := db.syncWith(func(f *os.File) error {
+			if calls++; calls > syncAttempts+1 {
+				return nil // no bound: end the test instead of looping
+			}
+			shrunk := h.run(db.Shrink) // blocks if the fsync holds a lock
+			if !awaitErr(t, shrunk, 2*time.Second, "Shrink during the fsync") {
+				return nil
+			}
+			return f.Sync()
+		})
+		if !errors.Is(err, os.ErrClosed) || calls != syncAttempts {
+			t.Fatalf("repeated replacement: err = %v after %d fsyncs, want ErrClosed after %d", err, calls, syncAttempts)
+		}
+		// Every attempt finds the same handle closed.
+		calls = 0
+		err = db.syncWith(func(*os.File) error {
+			if calls++; calls > syncAttempts+1 {
+				return nil
+			}
+			return os.ErrClosed
+		})
+		if !errors.Is(err, os.ErrClosed) || calls != syncAttempts {
+			t.Fatalf("unchanged handle: err = %v after %d fsyncs, want ErrClosed after %d", err, calls, syncAttempts)
+		}
+		if got := db.synced.Load(); got != 0 {
+			t.Fatalf("synced = %d after failed Syncs, want 0", got)
+		}
+	})
+	t.Run("close after the last attempt", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := setTTLKey(db, "a"); err != nil {
+			t.Fatal(err)
+		}
+		h := newHeldSync(t)
+		// Two Shrinks replace the file, then Close ends the third attempt.
+		calls := 0
+		err := db.syncWith(func(f *os.File) error {
+			calls++
+			op := db.Shrink
+			if calls == syncAttempts {
+				op = db.Close
+			}
+			if !awaitErr(t, h.run(op), 2*time.Second, "Shrink or Close during the fsync") {
+				return nil
+			}
+			return f.Sync()
+		})
+		if err != ErrDatabaseClosed || calls != syncAttempts {
+			t.Fatalf("Sync = %v after %d fsyncs, want ErrDatabaseClosed after %d", err, calls, syncAttempts)
+		}
+	})
+	t.Run("counters cross MaxInt32", func(t *testing.T) {
+		db := manualTickDB(t, true)
+		if err := db.SetConfig(Config{SyncPolicy: EverySecond, AutoShrinkDisabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		db.flushes = math.MaxInt32 - 1 // set directly; 2^31 commits are too many to run
+		db.synced.Store(db.flushes)
+		for _, key := range []string{"a", "b", "c"} {
+			if err := setTTLKey(db, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if db.flushes <= math.MaxInt32 {
+			t.Fatalf("flushes = %d, want more than MaxInt32", db.flushes)
+		}
+		calls := 0
+		if err := db.syncWith(countSync(&calls)); err != nil {
+			t.Fatal(err)
+		}
+		if got := db.synced.Load(); got != db.flushes {
+			t.Fatalf("synced = %d, want %d", got, db.flushes)
+		}
+		db.tick(countSync(&calls)) // nothing outstanding
+		if calls != 1 {
+			t.Fatalf("fsync calls = %d, want 1: the tick after Sync must not fsync", calls)
+		}
+	})
+}
+
+// S1: Open fixes the paths. A later change of the working directory moves
+// neither Sync's directory nor the files that Shrink writes and replaces.
+func TestRegressDBPathsFixedAtOpen(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	t.Chdir(a)
+	db, err := Open("x.db") // a relative path
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := setTTLKey(db, "k"); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(b)
+	if err := db.Shrink(); err != nil {
+		t.Fatalf("Shrink after chdir: %v", err)
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatalf("Sync after chdir: %v", err)
+	}
+	if left, _ := os.ReadDir(b); len(left) != 0 {
+		t.Fatalf("Shrink wrote %d files in the new working directory", len(left))
+	}
+	if want, _ := filepath.EvalSymlinks(a); db.dir != want {
+		t.Fatalf("db.dir = %q, want %q", db.dir, want)
+	}
+	if fi, err := os.Stat(filepath.Join(a, "x.db")); err != nil || fi.Size() == 0 {
+		t.Fatalf("database file in the first directory: %v", err)
+	}
+}
+
+// S1: the path is a dangling symlink. Open creates the target, so its
+// directory is the target's. Shrink then replaces the symlink with the file,
+// and the directory is the symlink's.
+func TestRegressDBDirFollowsSymlinkAndShrink(t *testing.T) {
+	a, c := t.TempDir(), t.TempDir()
+	link := filepath.Join(c, "link.db")
+	if err := os.Symlink(filepath.Join(a, "x.db"), link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	db, err := Open(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := setTTLKey(db, "k"); err != nil {
+		t.Fatal(err)
+	}
+	realA, _ := filepath.EvalSymlinks(a)
+	realC, _ := filepath.EvalSymlinks(c)
+	if db.dir != realA {
+		t.Fatalf("db.dir = %q, want the target directory %q", db.dir, realA)
+	}
+	if err := db.Shrink(); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("Shrink did not replace the symlink: %v", err)
+	}
+	if db.dir != realC {
+		t.Fatalf("db.dir = %q after Shrink, want %q: the file now lives there", db.dir, realC)
 	}
 }

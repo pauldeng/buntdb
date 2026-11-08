@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	randv2 "math/rand/v2"
@@ -1441,7 +1440,7 @@ func TestDatabaseFormat(t *testing.T) {
 		if err := os.RemoveAll("data.db"); err != nil {
 			t.Fatal(err)
 		}
-		if err := ioutil.WriteFile("data.db", []byte(resp), 0666); err != nil {
+		if err := os.WriteFile("data.db", []byte(resp), 0666); err != nil {
 			t.Fatal(err)
 		}
 		db := testOpen(t)
@@ -1450,7 +1449,7 @@ func TestDatabaseFormat(t *testing.T) {
 	testFormat := func(t *testing.T, expectValid bool, resp string, do func(db *DB) error) {
 		t.Helper()
 		os.RemoveAll("data.db")
-		if err := ioutil.WriteFile("data.db", []byte(resp), 0666); err != nil {
+		if err := os.WriteFile("data.db", []byte(resp), 0666); err != nil {
 			t.Fatal(err)
 		}
 		defer os.RemoveAll("data.db")
@@ -1692,7 +1691,7 @@ func TestOpeningInvalidDatabaseFile(t *testing.T) {
 	if err := os.RemoveAll("data.db"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile("data.db", []byte("invalid\r\nfile"), 0666); err != nil {
+	if err := os.WriteFile("data.db", []byte("invalid\r\nfile"), 0666); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = os.RemoveAll("data.db") }()
