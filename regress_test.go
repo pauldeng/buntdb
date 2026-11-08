@@ -6,6 +6,7 @@ package buntdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -21,6 +23,8 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 // A7: CreateSpatialIndexOptions accepted an *IndexOptions and passed nil to
@@ -2084,4 +2088,209 @@ func TestRegressCommitBufferRelease(t *testing.T) {
 			t.Fatalf("cap(db.buf) = %d after a 1 MiB commit, want a small kept buffer", c)
 		}
 	})
+}
+
+// U1b: gjson v1.20.1 changed what IndexJSON and IndexJSONCaseSensitive see.
+// Result.Less is unchanged, but surrogate decoding, the ~null and ~false
+// queries and the modifier switches feed it different values than v1.14.3.
+// A row is a pair of documents: ci and cs give the expected order for each
+// comparator, -1 for a < b, 1 for b < a and 0 for neither. Rows marked "v1.14.3"
+// order differently on the old version.
+
+type jsonPair struct {
+	name, path, a, b string
+	ci, cs           int
+}
+
+func checkJSONPairs(t *testing.T, pairs []jsonPair) {
+	t.Helper()
+	for _, p := range pairs {
+		t.Run(p.name, func(t *testing.T) {
+			for _, c := range []struct {
+				kind string
+				less func(a, b string) bool
+				want int
+			}{
+				{"IndexJSON", IndexJSON(p.path), p.ci},
+				{"IndexJSONCaseSensitive", IndexJSONCaseSensitive(p.path), p.cs},
+			} {
+				t.Run(c.kind, func(t *testing.T) {
+					if got := c.less(p.a, p.b); got != (c.want < 0) {
+						t.Errorf("less(a, b) = %v, want %v (a=%s b=%s)", got, c.want < 0, p.a, p.b)
+					}
+					if got := c.less(p.b, p.a); got != (c.want > 0) {
+						t.Errorf("less(b, a) = %v, want %v (a=%s b=%s)", got, c.want > 0, p.a, p.b)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRegressJSONIndexOrder(t *testing.T) {
+	str := func(s string) string { return `{"s":"` + s + `"}` }
+	checkJSONPairs(t, []jsonPair{
+		// v1.14.3 decodes the pair to U+FFFD only; v1.20.1 keeps the "A".
+		{"v1.14.3 high surrogate then escaped A", "s", str(`\uD800\u0041`), str(`\uFFFD0`), 1, 1},
+		{"v1.14.3 low surrogate then escaped A", "s", str(`\uDC00\u0041`), str(`\uFFFD0`), 1, 1},
+		// v1.14.3 merges two high surrogates into one U+FFFD.
+		{"v1.14.3 two high surrogates", "s", str(`\uD800\uD800`), str(`\uFFFD`), 1, 1},
+		// Unchanged: the literal "A" is not an escape.
+		{"high surrogate then A", "s", str(`\uD800A`), str("\uFFFD0"), 1, 1},
+		{"valid surrogate pair", "s", str(`\uD83D\uDE00`), str("z"), 1, 1},
+		{"valid pair equals itself decoded", "s", str(`\uD83D\uDE00`), str("\U0001F600"), 0, 0},
+		// An invalid or truncated escape ends the string there.
+		{"invalid escape", "s", str(`a\qb`), str("ab"), -1, -1},
+		{"truncated u escape", "s", str(`x\u12`), str("x"), 0, 0},
+		{"truncated u escape vs larger", "s", str(`x\u12`), str("y"), -1, -1},
+		// v1.14.3 ignores a dot pipeline such as ".[0]" after an escaped key (gjson TestIssue301).
+		{"v1.14.3 escaped key then dot path", `fav\.movie.[0]`, `{"fav.movie":[1]}`, `{"fav.movie":[2]}`, -1, -1},
+		// v1.20.1 has a stock @dig modifier, so the path "@dig" no longer reads the field "@dig".
+		// It runs recursive descent with an empty path and gives [] for both documents.
+		{"v1.14.3 @dig is a stock modifier", "@dig", `{"@dig":1}`, `{"@dig":2}`, 0, 0},
+		{"escaped dig reads the field", `\@dig`, `{"@dig":1}`, `{"@dig":2}`, -1, -1},
+		// v1.20.1 converts a string width with ParseFloat: "80.0" is 80, not 0, so
+		// @pretty prints [1,2] on one line, and [1] sorts after it by raw bytes.
+		{"v1.14.3 @pretty string width", `@pretty:{"width":"80.0"}`, `[1]`, `[1,2]`, 1, 1},
+		// v1.14.3 wraps an array index above uint64 (2^64+1 became 1); v1.20.1 saturates it.
+		{"v1.14.3 array index beyond uint64", `a.18446744073709551617`, `{"a":[1,2]}`, `{"a":[3,4]}`, 0, 0},
+		// A multipath key is escaped by AppendJSONString. Two classes of key bytes differ in v1.20.1
+		// (keyesc.sh compares all 256 single bytes and 20 UTF-8 edge sequences): backspace and form feed
+		// become \b and \f instead of \u0008 and \u000c, and invalid UTF-8 becomes a literal U+FFFD
+		// instead of the escape \ufffd. Each changes the order against another key. The paths hold real bytes.
+		{"v1.14.3 multipath key backspace", "{\b:a,\n:b}", `{"a":0}`, `{"b":0}`, -1, -1},
+		{"v1.14.3 multipath key invalid UTF-8", "{\xff:a,z:b}", `{"a":0}`, `{"b":0}`, 1, 1},
+		// v1.20.1 skips a bracketed part of a modifier argument when it looks for the pipe.
+		{"v1.14.3 modifier arg pipe inside brackets", `@this:unused(1|2)`, `[1]`, `[2]`, -1, -1},
+		// Types order Null < False < Number < String < True < JSON.
+		{"null < false", "s", `{"s":null}`, `{"s":false}`, -1, -1},
+		{"false < number", "s", `{"s":false}`, `{"s":1}`, -1, -1},
+		{"number < string", "s", `{"s":1}`, str("a"), -1, -1},
+		{"string < true", "s", str("a"), `{"s":true}`, -1, -1},
+		{"true < json", "s", `{"s":true}`, `{"s":{"x":1}}`, -1, -1},
+		{"numbers compare by value", "s", `{"s":2}`, `{"s":10}`, -1, -1},
+		// A missing path is Null with an empty Raw, so it sorts before a literal null.
+		{"missing < number", "s", `{"t":1}`, `{"s":0}`, -1, -1},
+		{"missing < null", "s", `{"t":1}`, `{"s":null}`, -1, -1},
+		{"missing < false", "s", `{}`, `{"s":false}`, -1, -1},
+		// Only the case-insensitive comparator folds case.
+		{"case-insensitive pair a, B", "s", str("a"), str("B"), -1, 1},
+		{"case-insensitive pair A, a", "s", str("A"), str("a"), 0, -1},
+	})
+}
+
+// The index path is user input to gjson.Get, so the ~null, ~false and ~*
+// query branches are reachable. v1.14.3 converted the value with Result.Bool;
+// v1.20.1 uses nullish and falseish. In v1.20.1 null and missing values match
+// ~null, and the string "x" does not match ~false. The rows that expect an
+// order compare a matching document (the selected id is a Number) with a
+// non-matching one (no result), so a query that matches nothing does not pass by
+// accident. The rows that expect equality ("skips", "matches nothing") pin
+// v1.20.1 behaviour where v1.14.3 matched.
+func TestRegressJSONIndexTildeQueries(t *testing.T) {
+	doc := func(v string) string { return `{"a":[{"v":` + v + `,"id":2}]}` }
+	const missing = `{"a":[{"id":2}]}`
+	checkJSONPairs(t, []jsonPair{
+		// v1.14.3: neither matches ~null, so both are missing.
+		{"v1.14.3 ~null matches null", `a.#(v==~null).id`, doc("false"), doc("null"), -1, -1},
+		{"v1.14.3 ~null matches a missing value", `a.#(v==~null).id`, doc("false"), missing, -1, -1},
+		// v1.14.3: "x".Bool() is false, so the string matches ~false there.
+		{"v1.14.3 ~false skips other strings", `a.#(v==~false).id`, doc(`"x"`), doc("false"), -1, -1},
+		{"~false matches 0", `a.#(v==~false).id`, doc("true"), doc("0"), -1, -1},
+		{"~false matches null", `a.#(v==~false).id`, doc("true"), doc("null"), -1, -1},
+		{"~false matches the string false", `a.#(v==~false).id`, doc("true"), doc(`"false"`), -1, -1},
+		{"~false matches a missing value", `a.#(v==~false).id`, doc("true"), missing, -1, -1},
+		{"~true matches 1", `a.#(v==~true).id`, doc("false"), doc("1"), -1, -1},
+		// v1.14.3: Bool() is false for an array, so ~false matched it.
+		{"v1.14.3 ~false skips arrays", `a.#(v==~false).id`, doc("true"), doc("[1]"), 0, 0},
+		// v1.14.3 turned any ~name into a bool; v1.20.1 matches an unknown name against nothing.
+		{"v1.14.3 unknown ~ name matches nothing", `a.#(v!=~foo).id`, `{"a":[]}`, doc("1"), 0, 0},
+		// v1.14.3: ~* matches nothing.
+		{"v1.14.3 ~* matches an existing value", `a.#(v==~*).id`, missing, doc("0"), -1, -1},
+	})
+	// The same path drives a real index.
+	t.Run("real index Ascend", func(t *testing.T) {
+		db, err := Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if err := db.CreateIndex("nul", "*", IndexJSON(`a.#(v==~null).id`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Update(func(tx *Tx) error {
+			for k, v := range map[string]string{"1": doc("null"), "2": doc("false"), "3": doc(`"x"`)} {
+				if _, _, err := tx.Set(k, v, nil); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var keys []string
+		if err := db.View(func(tx *Tx) error {
+			return tx.Ascend("nul", func(k, _ string) bool { keys = append(keys, k); return true })
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Keys 2 and 3 have no match (Null) and sort first, by key; key 1 matches with id 2.
+		if want := []string{"2", "3", "1"}; !slices.Equal(keys, want) {
+			t.Fatalf("Ascend over a.#(v==~null).id = %v, want %v", keys, want)
+		}
+	})
+}
+
+// gjson.DisableModifiers and gjson.AddModifier are package globals, so each
+// case runs in a child process that re-executes this test binary.
+const gjsonChildEnv = "BUNTDB_GJSON_CHILD"
+
+func TestRegressJSONIndexModifierGlobals(t *testing.T) {
+	for _, mode := range []string{"disable", "replace"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.v", "-test.run=^TestRegressJSONIndexModifierChild$")
+			cmd.Env = append(os.Environ(), gjsonChildEnv+"="+mode)
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "--- PASS: TestRegressJSONIndexModifierChild") {
+				t.Fatalf("child (%s) failed (err=%v):\n%s", mode, err, out)
+			}
+		})
+	}
+}
+
+// TestRegressJSONIndexModifierChild is the child process for
+// TestRegressJSONIndexModifierGlobals. It does nothing in a normal run.
+func TestRegressJSONIndexModifierChild(t *testing.T) {
+	mode := os.Getenv(gjsonChildEnv)
+	if mode == "" {
+		t.Skip("child process of TestRegressJSONIndexModifierGlobals")
+	}
+	// The stock @reverse turns [1,9] into [9,1] and [2,1] into [1,2], so b < a.
+	// Without the modifier the path is a missing key and neither is less.
+	// An identity @reverse would give a < b.
+	a, b := `[1,9]`, `[2,1]`
+	var want []jsonPair
+	switch mode {
+	case "disable":
+		gjson.DisableModifiers = true
+		// v1.20.1 ignores the switch, so the stock modifier still runs.
+		want = []jsonPair{{"DisableModifiers is ignored", "@reverse", a, b, 1, 1}}
+	case "replace":
+		gjson.AddModifier("reverse", func(json, arg string) string { return json })
+		gjson.AddModifier("buntdbid", func(json, arg string) string { return json })
+		// v1.20.1 ignores the replacement of a stock modifier; a new name still binds.
+		want = []jsonPair{
+			{"stock modifier is not replaced", "@reverse", a, b, 1, 1},
+			{"new modifier binds", "@buntdbid", a, b, -1, -1},
+		}
+	default:
+		t.Fatalf("unknown mode %q", mode)
+	}
+	checkJSONPairs(t, want)
 }

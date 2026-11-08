@@ -2890,6 +2890,108 @@ func Benchmark_Index_AscendRange(b *testing.B) {
 	b.StopTimer()
 }
 
+// benchJSON returns a memory database of 100000 keys with an IndexJSON index
+// "last" on name.last. docs[0] holds the documents the keys start with. With
+// updates, docs[1] is a second table for replacing them. The values are four
+// random letters of mixed case. The database closes when the benchmark ends.
+func benchJSON(b *testing.B, updates bool) (db *DB, keys []string, docs [2][]string) {
+	const n = 100000
+	b.StopTimer()
+	rng := benchRNG()
+	keys = make([]string, n)
+	for i, p := range rng.Perm(n) {
+		keys[p] = testUint64Hex(uint64(i))
+	}
+	tables := 1
+	if updates {
+		tables = 2
+	}
+	for k := range tables {
+		docs[k] = make([]string, n)
+		for i := range docs[k] {
+			last := make([]byte, 4)
+			for j := range last {
+				last[j] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[rng.IntN(52)]
+			}
+			docs[k][i] = `{"name":{"last":"` + string(last) + `"},"age":` + strconv.Itoa(rng.IntN(100)) + `}`
+		}
+	}
+	db, err := Open(":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		b.StopTimer()
+		if err := db.Close(); err != nil {
+			b.Error(err)
+		}
+	})
+	if err := db.CreateIndex("last", "*", IndexJSON("name.last")); err != nil {
+		b.Fatal(err)
+	}
+	benchBatches(b, db, n, 100, func(tx *Tx, i int) error {
+		_, _, err := tx.Set(keys[i], docs[0][i], nil)
+		return err
+	})
+	return db, keys, docs
+}
+
+// Benchmark_JSON_Set times replacing the document of a key in an IndexJSON
+// index, which removes and inserts the item in the index tree and runs
+// gjson.Get on every comparison.
+func Benchmark_JSON_Set(b *testing.B) {
+	db, keys, docs := benchJSON(b, true)
+	b.StartTimer()
+	for pass, done := 1, 0; done < b.N; pass++ {
+		d := docs[pass%2]
+		benchBatches(b, db, min(b.N-done, len(keys)), 100, func(tx *Tx, i int) error {
+			_, _, err := tx.Set(keys[i], d[i], nil)
+			return err
+		})
+		done += len(keys)
+	}
+	b.StopTimer()
+}
+
+// Benchmark_JSON_Ascend times one AscendRange over the IndexJSON index, which
+// compares each visited item with the upper bound through gjson.Get. The range
+// ["mm", "mn") holds about 150 items. One scan outside the timed loop must
+// match the count taken from the fixture, and each timed scan must return it.
+func Benchmark_JSON_Ascend(b *testing.B) {
+	db, _, docs := benchJSON(b, false)
+	const lo, hi = `{"name":{"last":"mm"}}`, `{"name":{"last":"mn"}}`
+	want := 0
+	for _, d := range docs[0] {
+		if l := strings.ToLower(d[len(`{"name":{"last":"`):][:4]); l >= "mm" && l < "mn" {
+			want++
+		}
+	}
+	if want < 50 {
+		b.Fatalf("fixture range holds %d items, want about 150", want)
+	}
+	scan := func() (count int) {
+		if err := db.View(func(tx *Tx) error {
+			return tx.AscendRange("last", lo, hi, func(key, val string) bool {
+				count++
+				return true
+			})
+		}); err != nil {
+			b.Fatal(err)
+		}
+		return count
+	}
+	if n := scan(); n != want {
+		b.Fatalf("range scan returned %d items, want %d from the fixture", n, want)
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		if n := scan(); n != want {
+			b.Fatalf("range scan returned %d items, want %d", n, want)
+		}
+	}
+	b.StopTimer()
+}
+
 /*
 	func Benchmark_Spatial_2D(t *testing.B) {
 		N := 100000

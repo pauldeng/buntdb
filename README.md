@@ -434,6 +434,30 @@ Order by age range 30-50
 2: {"name":{"first":"Janet","last":"Prichard"},"age":47}
 ```
 
+### JSON index changes with GJSON v1.20.1
+
+BuntDB now uses GJSON v1.20.1. These changes affect the order of `IndexJSON` and `IndexJSONCaseSensitive` indexes.
+`CreateIndex` rebuilds an index from the stored data, so existing data needs no migration.
+
+- **Surrogate escapes.** A high surrogate escape that is not followed by a low surrogate escape decodes to U+FFFD alone. The next escape stays separate.
+  For example, `"\uD800\u0041"` now decodes to `"\uFFFDA"`. It was `"\uFFFD"`, so it sorted before `"\uFFFD0"` and now sorts after it.
+  Two high surrogates, `"\uD800\uD800"`, now decode to two U+FFFD characters instead of one. A low surrogate followed by an escape also decodes alone.
+- **`~null`, `~false` and `~*` queries.** In an index path such as `a.#(v==~null).id`, `~null` now matches null and missing values. It matched nothing before.
+  `~false` now matches only false, null, missing values, `0` and strings that parse as false, such as `"false"`. It no longer matches other strings, arrays or objects.
+  `~*` now matches every existing value. An unknown name, such as `~foo`, now matches nothing. An item that matched before can sort differently.
+- **Escaped keys before a dot pipeline.** A path such as `fav\.movie.[0]` now follows the dot pipeline `.[0]` after the escaped key. GJSON v1.14.3 ignored it.
+  Documents `{"fav.movie":[1]}` and `{"fav.movie":[2]}` compared equal before and now sort by the array element.
+- **Array indexes above uint64.** A path such as `a.18446744073709551617` no longer wraps around to index 1. The index saturates, so the path finds nothing.
+- **Modifiers.** `gjson.DisableModifiers` no longer has an effect, so `@` paths always run. `gjson.AddModifier` ignores a stock modifier name such as `reverse`.
+  A path that uses either setting sorts differently. Build with `-ldflags="-X 'github.com/tidwall/gjson.disableModifiers=true'"` to disable modifiers.
+- **New `@dig` modifier.** The path `@dig` no longer reads a field named `@dig`. It runs the modifier, which returns `[]` for both documents, so `{"@dig":1}` and `{"@dig":2}` compare equal.
+  Write `\@dig` to read the field.
+- **Multipath keys.** A multipath such as `"{\x08:a,\n:b}"` (Go string syntax) escapes its key names differently. Two classes of key bytes change:
+  backspace and form feed, now written `\b` and `\f` instead of `\u0008` and `\u000c`, and every invalid UTF-8 byte, now a literal U+FFFD instead of the escape `\ufffd`.
+  The raw result changes, so the order against other keys can flip. Valid UTF-8 and all other control characters stay the same.
+- **Modifier arguments.** A bracketed part of a modifier argument, such as `@this:unused(1|2)`, no longer splits at the `|` inside it. The path now selects the whole document.
+- **Modifier numbers.** A string argument such as `{"width":"80.0"}` for `@pretty` now parses as 80. It was 0, so the formatted output and its order change.
+
 ## Multi Value Index
 With BuntDB it's possible to join multiple values on a single index.
 This is similar to a [multi column index](http://dev.mysql.com/doc/refman/5.7/en/multiple-column-indexes.html) in a traditional SQL database.
