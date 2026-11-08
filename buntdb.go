@@ -2734,6 +2734,9 @@ func btreeDescendLessOrEqual(tr *btree.BTree, pivot interface{},
 }
 
 func btreeNew(less func(a, b interface{}) bool) *btree.BTree {
-	// Using NewNonConcurrent because we're managing our own locks.
-	return btree.NewNonConcurrent(less)
+	// NoLocks because we're managing our own locks. Degree 128 keeps the
+	// btree v1.4.2 node layout (at most 255 items per node). The v1.8.2 default
+	// of 32 failed the memory gate (+5.9% plain, +16.8% index); the evidence is
+	// in bench/round12/step6a-u1/.
+	return btree.NewOptions(less, btree.Options{NoLocks: true, Degree: 128})
 }

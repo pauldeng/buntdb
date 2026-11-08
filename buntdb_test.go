@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"math"
 	"math/rand"
+	randv2 "math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2353,7 +2354,18 @@ func textHexUint64(s string) uint64 {
 	n, _ := strconv.ParseUint(s, 16, 64)
 	return n
 }
+
+// benchRNG returns the fixed-seed generator for benchmark data (REVIEW_PLAN.md
+// section 13). Every call returns the same sequence, so each benchmark build
+// sees identical fixtures.
+func benchRNG() *randv2.Rand {
+	const seed = 20261107
+	return randv2.New(randv2.NewPCG(seed, seed))
+}
+
+// benchClose stops the timer first, so unlink, Close and its fsync are not timed.
 func benchClose(t *testing.B, persist bool, db *DB) {
+	t.StopTimer()
 	if persist {
 		if err := os.RemoveAll("data.db"); err != nil {
 			t.Fatal(err)
@@ -2370,7 +2382,7 @@ func benchOpenFillData(t *testing.B, N int,
 	batch int) (db *DB, keys, vals []string) {
 	///
 	t.StopTimer()
-	rand.Seed(time.Now().UnixNano())
+	rng := benchRNG()
 	var err error
 	if persist {
 		if err := os.RemoveAll("data.db"); err != nil {
@@ -2385,14 +2397,14 @@ func benchOpenFillData(t *testing.B, N int,
 	}
 	keys = make([]string, N)
 	vals = make([]string, N)
-	perm := rand.Perm(N)
+	perm := rng.Perm(N)
 	for i := 0; i < N; i++ {
 		if random && set {
 			keys[perm[i]] = testUint64Hex(uint64(i))
-			vals[perm[i]] = strconv.FormatInt(rand.Int63()%1000+1000, 10)
+			vals[perm[i]] = strconv.FormatInt(rng.Int64N(1000)+1000, 10)
 		} else {
 			keys[i] = testUint64Hex(uint64(i))
-			vals[i] = strconv.FormatInt(rand.Int63()%1000+1000, 10)
+			vals[i] = strconv.FormatInt(rng.Int64N(1000)+1000, 10)
 		}
 	}
 	if set {
@@ -2666,6 +2678,216 @@ func Benchmark_Descend_1000(t *testing.B) {
 }
 func Benchmark_Descend_10000(t *testing.B) {
 	benchScan(t, false, 10000)
+}
+
+// benchBatches runs f for i in [0, n) in write transactions of at most batch
+// calls. The timer state is the caller's.
+func benchBatches(b *testing.B, db *DB, n, batch int, f func(tx *Tx, i int) error) {
+	b.Helper()
+	for i := 0; i < n; {
+		if err := db.Update(func(tx *Tx) error {
+			for j := 0; j < batch && i < n; j++ {
+				if err := f(tx, i); err != nil {
+					return err
+				}
+				i++
+			}
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// benchTTL times TTL Set (insert), replace (new deadline) and delete on a
+// memory database, so every operation touches the expiry tree. Keys arrive in
+// random order with random deadlines from the fixed seed. b.N operations run in
+// chunks of at most 100000 keys, each on a fresh database. The fixture and the
+// teardown run with the timer stopped.
+func benchTTL(b *testing.B, op string) {
+	const chunk, batch = 100000, 100
+	for N := b.N; N > 0; {
+		n := min(N, chunk)
+		N -= n
+		benchTTLChunk(b, op, n, batch)
+	}
+}
+
+func benchTTLChunk(b *testing.B, op string, n, batch int) {
+	b.StopTimer()
+	rng := benchRNG()
+	keys := make([]string, n)
+	for i, p := range rng.Perm(n) {
+		keys[p] = testUint64Hex(uint64(i))
+	}
+	deadlines := func() []SetOptions {
+		o := make([]SetOptions, n)
+		for i := range o {
+			o[i] = SetOptions{Expires: true, TTL: time.Hour + time.Duration(rng.IntN(1<<20))*time.Millisecond}
+		}
+		return o
+	}
+	opts := deadlines()
+	var replace []SetOptions
+	if op == "replace" {
+		replace = deadlines()
+	}
+	db, err := Open(":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		b.StopTimer()
+		if err := db.Close(); err != nil {
+			b.Error(err)
+		}
+	}()
+	set := func(o []SetOptions) {
+		benchBatches(b, db, n, batch, func(tx *Tx, i int) error {
+			_, _, err := tx.Set(keys[i], "val", &o[i])
+			return err
+		})
+	}
+	if op != "insert" {
+		set(opts)
+	}
+	b.StartTimer()
+	switch op {
+	case "insert":
+		set(opts)
+	case "replace":
+		set(replace)
+	case "delete":
+		benchBatches(b, db, n, batch, func(tx *Tx, i int) error {
+			_, err := tx.Delete(keys[i])
+			return err
+		})
+	}
+	b.StopTimer()
+}
+
+func Benchmark_TTL_Set(b *testing.B)     { benchTTL(b, "insert") }
+func Benchmark_TTL_Replace(b *testing.B) { benchTTL(b, "replace") }
+func Benchmark_TTL_Delete(b *testing.B)  { benchTTL(b, "delete") }
+
+// benchIndex returns a memory database of 100000 keys with an IndexInt index
+// "val" over random values in [0, 1000000). vals[0] holds the values the keys
+// start with. With updates, vals[1] is a second table for replacing them. The
+// database closes when the benchmark ends.
+func benchIndex(b *testing.B, updates bool) (db *DB, keys []string, vals [2][]string) {
+	const n = 100000
+	b.StopTimer()
+	rng := benchRNG()
+	keys = make([]string, n)
+	for i, p := range rng.Perm(n) {
+		keys[p] = testUint64Hex(uint64(i))
+	}
+	tables := 1
+	if updates {
+		tables = 2
+	}
+	for k := range tables {
+		vals[k] = make([]string, n)
+		for i := range vals[k] {
+			vals[k][i] = strconv.Itoa(rng.IntN(1000000))
+		}
+	}
+	db, err := Open(":memory:")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		b.StopTimer()
+		if err := db.Close(); err != nil {
+			b.Error(err)
+		}
+	})
+	if err := db.CreateIndex("val", "*", IndexInt); err != nil {
+		b.Fatal(err)
+	}
+	benchBatches(b, db, n, 100, func(tx *Tx, i int) error {
+		_, _, err := tx.Set(keys[i], vals[0][i], nil)
+		return err
+	})
+	return db, keys, vals
+}
+
+// Benchmark_Index_Update times replacing the value of an indexed key, which
+// removes and inserts the item in the secondary-index tree.
+func Benchmark_Index_Update(b *testing.B) {
+	db, keys, vals := benchIndex(b, true)
+	b.StartTimer()
+	for pass, done := 1, 0; done < b.N; pass++ {
+		v := vals[pass%2]
+		benchBatches(b, db, min(b.N-done, len(keys)), 100, func(tx *Tx, i int) error {
+			_, _, err := tx.Set(keys[i], v[i], nil)
+			return err
+		})
+		done += len(keys)
+	}
+	b.StopTimer()
+}
+
+// Benchmark_Index_AscendRange times one range scan of the "val" index over
+// about 1000 items per operation. The expected result comes from the fixture
+// values, not from the database: every key whose value is in [lo, hi), ordered
+// by value and then by key. One scan outside the timed loop must return exactly
+// that sequence, and each timed scan must return the same count.
+func Benchmark_Index_AscendRange(b *testing.B) {
+	const lo, hi = 500000, 510000
+	db, keys, vals := benchIndex(b, false)
+	type kv struct {
+		key string
+		val int
+	}
+	var want []kv
+	for i, v := range vals[0] {
+		if n, _ := strconv.Atoi(v); n >= lo && n < hi {
+			want = append(want, kv{keys[i], n})
+		}
+	}
+	slices.SortFunc(want, func(a, b kv) int {
+		if a.val != b.val {
+			return a.val - b.val
+		}
+		return strings.Compare(a.key, b.key)
+	})
+	if len(want) < 500 || len(want) > 2000 {
+		b.Fatalf("fixture range holds %d items, want about 1000", len(want))
+	}
+	loS, hiS := strconv.Itoa(lo), strconv.Itoa(hi)
+	// Validation scan, outside the timed loop.
+	var got []kv
+	if err := db.View(func(tx *Tx) error {
+		return tx.AscendRange("val", loS, hiS, func(key, val string) bool {
+			n, _ := strconv.Atoi(val)
+			got = append(got, kv{key, n})
+			return true
+		})
+	}); err != nil {
+		b.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		b.Fatalf("range scan returned %d items, want %d in value-then-key order from the fixture", len(got), len(want))
+	}
+	scan := func() (count int) {
+		if err := db.View(func(tx *Tx) error {
+			return tx.AscendRange("val", loS, hiS, func(key, val string) bool {
+				count++
+				return true
+			})
+		}); err != nil {
+			b.Fatal(err)
+		}
+		return count
+	}
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		if n := scan(); n != len(want) {
+			b.Fatalf("range scan returned %d items, want %d", n, len(want))
+		}
+	}
+	b.StopTimer()
 }
 
 /*
