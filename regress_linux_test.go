@@ -235,7 +235,7 @@ func TestRegressCloseReportsSyncError(t *testing.T) {
 }
 
 // C11: a failed background fsync must be retried while the DB is idle. The
-// fsync before the marker is the background manager's; the fsync after it is
+// fsyncs before the marker are the background ticks'; the fsync after it is
 // Close's. The first fsync fails, so a retry is a second fsync before the marker.
 func TestRegressBackgroundSyncRetried(t *testing.T) {
 	const marker = "buntdb-idle-end"
@@ -258,19 +258,18 @@ func TestRegressBackgroundSyncRetried(t *testing.T) {
 		if len(syncs) == 0 || !strings.Contains(syncs[0], "(INJECTED)") {
 			t.Fatalf("the first background fsync was not injected:\n%s", trace)
 		}
-		if len(syncs) < 2 {
-			t.Fatalf("failed background fsync was not retried while idle:\n%s", trace)
-		}
-		// Once a sync succeeds, the idle database needs no more. A failure may
-		// repeat when the retry runs on another thread, where strace injects again.
-		// The last sync need not succeed: every retry may land on a fresh thread.
-		for _, s := range syncs[:len(syncs)-1] {
-			if !strings.Contains(s, "(INJECTED)") {
-				t.Fatalf("background fsync ran again after a successful one:\n%s", trace)
-			}
+		// One retry succeeds, and the idle database then needs no more.
+		if len(syncs) != 2 || strings.Contains(syncs[1], "(INJECTED)") {
+			t.Fatalf("want one failed and one good background fsync before the marker:\n%s", trace)
 		}
 		return
 	}
+	// strace counts fsyncs per thread. The ticks run by hand on this thread,
+	// so the first background fsync is the injected one, and the marker
+	// cannot overlap a background fsync.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	tickInterval = 0 // not restored: this child process runs only this test
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "data.db"))
 	if err != nil {
@@ -285,11 +284,11 @@ func TestRegressBackgroundSyncRetried(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(5500 * time.Millisecond) // five background ticks, no new writes
-	// The marker shows up in the trace. Holding db.mu keeps it out of a background fsync.
-	db.mu.Lock()
-	_ = os.Remove(filepath.Join(dir, marker))
-	db.mu.Unlock()
+	flushes := 0
+	for range 5 { // five background ticks, no new writes
+		flushes, _ = db.tick(flushes, (*os.File).Sync)
+	}
+	_ = os.Remove(filepath.Join(dir, marker)) // the marker shows up in the trace
 	if err := db.Close(); err != nil && !errors.Is(err, syscall.EIO) {
 		t.Fatal(err)
 	}

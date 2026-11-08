@@ -175,7 +175,9 @@ func Open(path string) (*DB, error) {
 		}
 	}
 	// start the background manager.
-	go db.backgroundManager()
+	if tickInterval > 0 {
+		go db.backgroundManager(tickInterval)
+	}
 	return db, nil
 }
 
@@ -557,29 +559,59 @@ func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 
 // backgroundManager runs continuously in the background and performs various
 // operations such as removing expired items and syncing to disk.
-func (db *DB) backgroundManager() {
+func (db *DB) backgroundManager(interval time.Duration) {
 	flushes := 0
-	t := time.NewTicker(time.Second)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for range t.C {
-		var shrink bool
-		// Open a standard view. This will take a full lock of the
-		// database thus allowing for access to anything we need.
-		var onExpired func([]string)
-		var expired []*dbItem
-		var onExpiredSync func(key, value string, tx *Tx) error
-		err := db.Update(func(tx *Tx) error {
+		var stop bool
+		if flushes, stop = db.tick(flushes, (*os.File).Sync); stop {
+			break
+		}
+	}
+}
+
+// tickInterval is the period of the background manager, read by Open. Zero
+// starts no manager: tests use it and call tick by hand.
+var tickInterval = time.Second
+
+// tick runs one background pass: the expiry sweep, the EverySecond fsync and
+// the auto shrink. flushes is the db.flushes value of the last good background
+// sync; tick returns the new value, and true when the database is closed.
+// syncFile is the fsync; tests pass one that holds or fails.
+func (db *DB) tick(flushes int, syncFile func(*os.File) error) (int, bool) {
+	// Look first with the read lock, so that a tick with no expired
+	// item does not block readers.
+	var shrink, due bool
+	db.mu.RLock()
+	closed := db.closed
+	if !closed {
+		if first, ok := db.exps.Front(); ok {
+			due = db.exps.less(first, &dbItem{
+				opts: &dbItemOpts{ex: true, exat: time.Now()},
+			})
+		}
+		if db.persist && !db.config.AutoShrinkDisabled {
+			// Seek(0, SeekCurrent) only reads the offset. Writers move it
+			// under the write lock.
+			pos, err := db.file.Seek(0, io.SeekCurrent)
+			shrink = err == nil && pos > int64(db.config.AutoShrinkMinSize) &&
+				shrinkDue(pos, db.lastaofsz, db.config.AutoShrinkPercentage)
+		}
+	}
+	db.mu.RUnlock()
+	if closed {
+		return flushes, true
+	}
+	var onExpired func([]string)
+	var expired []*dbItem
+	var onExpiredSync func(key, value string, tx *Tx) error
+	var err error
+	if due {
+		err = db.Update(func(tx *Tx) error {
 			onExpired = db.config.OnExpired
 			if onExpired == nil {
 				onExpiredSync = db.config.OnExpiredSync
-			}
-			if db.persist && !db.config.AutoShrinkDisabled {
-				pos, err := db.file.Seek(0, 1)
-				if err != nil {
-					return err
-				}
-				shrink = pos > int64(db.config.AutoShrinkMinSize) &&
-					shrinkDue(pos, db.lastaofsz, db.config.AutoShrinkPercentage)
 			}
 			// produce a list of expired items that need removing
 			btreeAscendLessThan(db.exps, &dbItem{
@@ -608,39 +640,36 @@ func (db *DB) backgroundManager() {
 			}
 			return nil
 		})
-		if err == ErrDatabaseClosed {
-			break
-		}
-
-		// send expired event, if needed
-		if onExpired != nil && len(expired) > 0 {
-			keys := make([]string, 0, 32)
-			for _, itm := range expired {
-				keys = append(keys, itm.key)
-			}
-			onExpired(keys)
-		}
-
-		// execute a disk sync, if needed
-		func() {
-			db.mu.Lock()
-			defer db.mu.Unlock()
-			if !db.closed && db.persist && db.config.SyncPolicy == EverySecond &&
-				flushes != db.flushes {
-				// Advance only on success, so a failed sync is retried.
-				if db.file.Sync() == nil {
-					flushes = db.flushes
-				}
-			}
-		}()
-		if shrink {
-			if err = db.Shrink(); err != nil {
-				if err == ErrDatabaseClosed {
-					break
-				}
-			}
-		}
 	}
+	if err == ErrDatabaseClosed {
+		return flushes, true
+	}
+
+	// send expired event, if needed
+	if onExpired != nil && len(expired) > 0 {
+		keys := make([]string, 0, 32)
+		for _, itm := range expired {
+			keys = append(keys, itm.key)
+		}
+		onExpired(keys)
+	}
+
+	// Execute a disk sync, if needed. The fsync runs without a lock, so
+	// readers and writers do not wait for it. A concurrent Shrink or Close
+	// may close f, and the sync may then fail. A failed sync does not
+	// advance flushes, so the next tick retries while the database is open.
+	db.mu.RLock()
+	f, n := db.file, db.flushes
+	syncDue := !db.closed && db.persist &&
+		db.config.SyncPolicy == EverySecond && flushes != n
+	db.mu.RUnlock()
+	if syncDue && syncFile(f) == nil {
+		flushes = n
+	}
+	if shrink && db.Shrink() == ErrDatabaseClosed {
+		return flushes, true
+	}
+	return flushes, false
 }
 
 // shrinkDue reports whether an aof file of pos bytes is more than pct percent

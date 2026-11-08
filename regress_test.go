@@ -2427,3 +2427,261 @@ func TestBTreeAdapterMatrix(t *testing.T) {
 		}
 	}
 }
+
+// manualTickDB opens a database with no background manager, so the test
+// drives db.tick by hand. persist uses a file in a temp dir.
+func manualTickDB(t *testing.T, persist bool) *DB {
+	t.Helper()
+	old := tickInterval
+	tickInterval = 0
+	defer func() { tickInterval = old }()
+	path := ":memory:"
+	if persist {
+		path = filepath.Join(t.TempDir(), "tick.db")
+	}
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// goErr runs fn in a goroutine and returns a channel with its result.
+func goErr(fn func() error) chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- fn() }()
+	return ch
+}
+
+// awaitErr waits up to d for ch. It reports a timeout as an error, and
+// returns false then; the caller must unblock the worker and join it.
+func awaitErr(t *testing.T, ch chan error, d time.Duration, what string) bool {
+	t.Helper()
+	select {
+	case err := <-ch:
+		if err != nil {
+			t.Errorf("%s: %v", what, err)
+		}
+		return true
+	case <-time.After(d):
+		t.Errorf("%s did not finish within %v", what, d)
+		return false
+	}
+}
+
+func setTTLKey(db *DB, key string) error {
+	return db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set(key, "v", &SetOptions{Expires: true, TTL: time.Hour})
+		return err
+	})
+}
+
+// T1, T2: a tick with no expired item, or with only an EverySecond fsync to do,
+// must not take the write lock. The tick runs while a read transaction is
+// open; with the write lock it would wait for that transaction.
+func TestRegressTickDoesNotBlockReaders(t *testing.T) {
+	for _, tc := range []struct{ persist, ttl bool }{
+		{false, false}, {false, true}, {true, false}, {true, true},
+	} {
+		persist := tc.persist
+		t.Run(fmt.Sprintf("persist=%v/ttl=%v", tc.persist, tc.ttl), func(t *testing.T) {
+			db := manualTickDB(t, persist)
+			// A pending write to sync, and with ttl a future expiry; without
+			// ttl the expiry tree is empty.
+			err := db.Update(func(tx *Tx) error {
+				var opts *SetOptions
+				if tc.ttl {
+					opts = &SetOptions{Expires: true, TTL: time.Hour}
+				}
+				_, _, err := tx.Set("key", "v", opts)
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			held, err := db.Begin(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var flushes int
+			noSync := func(*os.File) error { return nil } // no storage stalls in the timing
+			tick := goErr(func() error { flushes, _ = db.tick(0, noSync); return nil })
+			ok := awaitErr(t, tick, 2*time.Second, "tick during a read transaction")
+			if err := held.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				awaitErr(t, tick, 10*time.Second, "tick after rollback") // join the worker
+				return
+			}
+			if want := map[bool]int{false: 0, true: db.flushes}[persist]; flushes != want {
+				t.Fatalf("tick returned flushes %d, want %d", flushes, want)
+			}
+			if err := db.View(func(tx *Tx) error { _, err := tx.Get("key"); return err }); err != nil {
+				t.Fatalf("the key was swept: %v", err)
+			}
+		})
+	}
+}
+
+// T2: the background fsync holds no lock, acknowledges only the writes made
+// before it started, retries after a failure, does nothing when clean, and
+// copes with Shrink and Close replacing or closing the file.
+func TestRegressTickSyncWithoutLock(t *testing.T) {
+	db := manualTickDB(t, true)
+	if err := db.SetConfig(Config{SyncPolicy: EverySecond, AutoShrinkDisabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan error)
+	cancel := make(chan struct{})    // closed by cleanup, so a held sync never blocks it
+	hold := func(f *os.File) error { // a sync that waits for the test
+		select {
+		case entered <- struct{}{}:
+		case <-cancel:
+			return errors.New("cancelled")
+		}
+		select {
+		case err := <-release:
+			if err != nil {
+				return err
+			}
+			return f.Sync()
+		case <-cancel:
+			return errors.New("cancelled")
+		}
+	}
+	type result struct {
+		flushes int
+		stop    bool
+	}
+	var pending chan result // the tick in progress; joined in cleanup
+	t.Cleanup(func() {
+		close(cancel)
+		if pending != nil {
+			<-pending
+		}
+	})
+	startTick := func(flushes int) {
+		ch := make(chan result, 1)
+		go func() { f, s := db.tick(flushes, hold); ch <- result{f, s} }()
+		pending = ch
+	}
+	enter := func() {
+		t.Helper()
+		select {
+		case <-entered:
+		case r := <-pending:
+			pending = nil
+			t.Fatalf("tick returned %+v without an fsync", r)
+		case <-time.After(5 * time.Second):
+			t.Fatal("background fsync was not called")
+		}
+	}
+	finish := func(syncErr error) result {
+		t.Helper()
+		release <- syncErr
+		select {
+		case r := <-pending:
+			pending = nil
+			return r
+		case <-time.After(5 * time.Second):
+			t.Fatal("tick did not return")
+			return result{}
+		}
+	}
+	// during runs fn while the fsync is held, and joins it after the release.
+	during := func(what string, fn func() error, syncErr error) result {
+		t.Helper()
+		ch := goErr(fn)
+		ok := awaitErr(t, ch, 2*time.Second, what+" during fsync")
+		r := finish(syncErr)
+		if !ok {
+			awaitErr(t, ch, 10*time.Second, what+" after fsync")
+		}
+		return r
+	}
+
+	if err := setTTLKey(db, "a"); err != nil {
+		t.Fatal(err)
+	}
+	before := db.flushes
+	startTick(0)
+	enter()
+	r := during("Update and View", func() error {
+		if err := setTTLKey(db, "b"); err != nil {
+			return err
+		}
+		return db.View(func(*Tx) error { return nil })
+	}, nil)
+	if r.flushes != before || r.stop {
+		t.Fatalf("tick = %+v, want flushes %d (the write during fsync is not acknowledged)", r, before)
+	}
+
+	// The write during the fsync makes the next tick sync again. It fails.
+	startTick(r.flushes)
+	enter()
+	if r2 := finish(errors.New("injected")); r2.flushes != r.flushes || r2.stop {
+		t.Fatalf("failed sync: tick = %+v, want flushes %d", r2, r.flushes)
+	}
+	// The retry succeeds and acknowledges every write.
+	startTick(r.flushes)
+	enter()
+	r = finish(nil)
+	if r.flushes != db.flushes || r.stop {
+		t.Fatalf("retry: tick = %+v, want flushes %d", r, db.flushes)
+	}
+	// Clean: no write since the last good sync, so no fsync.
+	startTick(r.flushes)
+	select {
+	case <-entered:
+		release <- nil
+		t.Fatal("tick synced a clean database")
+	case r2 := <-pending:
+		pending = nil
+		if r2.flushes != r.flushes || r2.stop {
+			t.Fatalf("clean tick = %+v, want flushes %d", r2, r.flushes)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("clean tick did not return")
+	}
+
+	// Shrink replaces the file while the fsync on the old file is held, and a
+	// write lands in the new file. The old sync fails; the next tick syncs the
+	// new file and acknowledges the write.
+	if err := setTTLKey(db, "c"); err != nil {
+		t.Fatal(err)
+	}
+	startTick(r.flushes)
+	enter()
+	r2 := during("Shrink and Update", func() error {
+		if err := db.Shrink(); err != nil {
+			return err
+		}
+		return setTTLKey(db, "d")
+	}, nil)
+	if r2.flushes != r.flushes || r2.stop {
+		t.Fatalf("sync on the replaced file: tick = %+v, want flushes %d", r2, r.flushes)
+	}
+	startTick(r2.flushes)
+	enter()
+	if r3 := finish(nil); r3.flushes != db.flushes || r3.stop {
+		t.Fatalf("sync on the new file: tick = %+v, want flushes %d", r3, db.flushes)
+	}
+
+	// Close finishes during a held fsync. The sync on the closed file fails,
+	// and the next tick stops.
+	if err := setTTLKey(db, "e"); err != nil {
+		t.Fatal(err)
+	}
+	flushes := db.flushes - 1
+	startTick(flushes)
+	enter()
+	if r4 := during("Close", db.Close, nil); r4.flushes != flushes || r4.stop {
+		t.Fatalf("sync on the closed file: tick = %+v, want flushes %d", r4, flushes)
+	}
+	if _, stop := db.tick(flushes, hold); !stop {
+		t.Fatal("tick after Close did not stop")
+	}
+}
