@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	github.com/tidwall/assert v0.1.1
-	github.com/tidwall/btree v1.8.2
+	github.com/tidwall/btree/v2 v2.0.0
 	github.com/tidwall/gjson v1.20.1
 	github.com/tidwall/grect v0.1.4
 	github.com/tidwall/lotsa v1.0.5

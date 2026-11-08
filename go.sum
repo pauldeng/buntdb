@@ -1,7 +1,7 @@
 github.com/tidwall/assert v0.1.1 h1:EhkQouX9uTsVCHJ4haAmst2aj1tdj+0BLvCBf34TT3k=
 github.com/tidwall/assert v0.1.1/go.mod h1:QLYtGyeqse53vuELQheYl9dngGCJQ+mTtlxcktb+Kj8=
-github.com/tidwall/btree v1.8.2 h1:mTY5iM4UTh2e80TG7RHDQQmnAY3xGNQA/DbU0olkhkA=
-github.com/tidwall/btree v1.8.2/go.mod h1:jBbTdUWhSZClZWoDg54VnvV7/54modSOzDN7VXftj1A=
+github.com/tidwall/btree/v2 v2.0.0 h1:OLfPRrwebFCBeqeMNZnOmY3RDf3ZcX6mQrWXiOEunfw=
+github.com/tidwall/btree/v2 v2.0.0/go.mod h1:9TpZnRbf1e8O5R0TuuSl8GXpPWDPwZACIXIJZfEr4M0=
 github.com/tidwall/gjson v1.12.1/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
 github.com/tidwall/gjson v1.20.1 h1:Jmex4ygKZxn92HFHlejG8sHcEODHttXyrj63hsJ7/GE=
 github.com/tidwall/gjson v1.20.1/go.mod h1:V37/opeE/JbLUOfH0QTXiNez2l0RUjYUhpT4szFQAfc=

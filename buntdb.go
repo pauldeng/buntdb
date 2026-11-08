@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"math"
 	"math/bits"
 	"os"
@@ -20,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tidwall/btree"
+	"github.com/tidwall/btree/v2"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/grect"
 	"github.com/tidwall/match"
@@ -71,8 +72,8 @@ type DB struct {
 	mu        sync.RWMutex      // the gatekeeper for all fields
 	file      *os.File          // the underlying file
 	buf       []byte            // a buffer to write to
-	keys      *btree.BTree      // a tree of all item ordered by key
-	exps      *btree.BTree      // a tree of items ordered by expiration
+	keys      *dbTree           // a tree of all item ordered by key
+	exps      *dbTree           // a tree of items ordered by expiration
 	idxs      map[string]*index // the index trees.
 	insIdxs   []*index          // a reuse buffer for gathering indexes
 	flushes   int               // a count of the number of disk flushes
@@ -137,9 +138,12 @@ type Config struct {
 	OnExpiredSync func(key, value string, tx *Tx) error
 }
 
-// exctx is a simple b-tree context for ordering by expiration.
-type exctx struct {
-	db *DB
+// initTrees gives the database empty keys and expiration trees and an empty
+// index map. Used by Open and by a FLUSHDB record during load.
+func (db *DB) initTrees() {
+	db.keys = btreeNew(lessByKey)
+	db.exps = btreeNew(lessExps)
+	db.idxs = make(map[string]*index)
 }
 
 // Open opens a database at the provided path.
@@ -147,9 +151,7 @@ type exctx struct {
 func Open(path string) (*DB, error) {
 	db := &DB{}
 	// initialize trees and indexes
-	db.keys = btreeNew(lessCtx(nil))
-	db.exps = btreeNew(lessCtx(&exctx{db}))
-	db.idxs = make(map[string]*index)
+	db.initTrees()
 	// initialize default configuration
 	db.config = Config{
 		SyncPolicy:           EverySecond,
@@ -214,8 +216,7 @@ func (db *DB) Save(wr io.Writer) error {
 	// use a buffered writer and flush every 4MB
 	var buf []byte
 	// iterated through every item in the database and write to the buffer
-	btreeAscend(db.keys, func(item interface{}) bool {
-		dbi := item.(*dbItem)
+	btreeAscend(db.keys, func(dbi *dbItem) bool {
 		buf = dbi.writeSetTo(buf)
 		if len(buf) > 1024*1024*4 {
 			// flush when buffer is over 4MB
@@ -263,7 +264,7 @@ func (db *DB) Load(rd io.Reader) error {
 // index represents a b-tree or r-tree index and also acts as the
 // b-tree/r-tree context for itself.
 type index struct {
-	btr     *btree.BTree                           // contains the items
+	btr     *dbTree                                // contains the items
 	rtr     *rtred.RTree                           // contains the items
 	name    string                                 // name of the index
 	pattern string                                 // a required key pattern
@@ -302,7 +303,7 @@ func (idx *index) clearCopy() *index {
 	}
 	// initialize with empty trees
 	if nidx.less != nil {
-		nidx.btr = btreeNew(lessCtx(nidx))
+		nidx.btr = btreeNew(nidx.lessItems)
 	}
 	if nidx.rect != nil {
 		nidx.rtr = rtred.New(nidx)
@@ -314,14 +315,13 @@ func (idx *index) clearCopy() *index {
 func (idx *index) rebuild() {
 	// initialize trees
 	if idx.less != nil {
-		idx.btr = btreeNew(lessCtx(idx))
+		idx.btr = btreeNew(idx.lessItems)
 	}
 	if idx.rect != nil {
 		idx.rtr = rtred.New(idx)
 	}
 	// iterate through all keys and fill the index
-	btreeAscend(idx.db.keys, func(item interface{}) bool {
-		dbi := item.(*dbItem)
+	btreeAscend(idx.db.keys, func(dbi *dbItem) bool {
 		if !idx.match(dbi.key) {
 			// does not match the pattern, continue
 			return true
@@ -480,11 +480,11 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 			idxs = append(idxs, idx)
 		}
 	}
-	prev := db.keys.Set(item)
+	prev, _ := db.keys.Set(item)
 	if prev != nil {
 		// A previous item was removed from the keys tree. Let's
 		// fully delete this item from all indexes.
-		pdbi = prev.(*dbItem)
+		pdbi = prev
 		if pdbi.opts != nil && pdbi.opts.ex {
 			// Remove it from the expires tree.
 			db.exps.Delete(pdbi)
@@ -531,9 +531,9 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 // found in the database
 func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 	var pdbi *dbItem
-	prev := db.keys.Delete(item)
+	prev, _ := db.keys.Delete(item)
 	if prev != nil {
-		pdbi = prev.(*dbItem)
+		pdbi = prev
 		if pdbi.opts != nil && pdbi.opts.ex {
 			// Remove it from the exipres tree.
 			db.exps.Delete(pdbi)
@@ -584,8 +584,8 @@ func (db *DB) backgroundManager() {
 			// produce a list of expired items that need removing
 			btreeAscendLessThan(db.exps, &dbItem{
 				opts: &dbItemOpts{ex: true, exat: time.Now()},
-			}, func(item interface{}) bool {
-				expired = append(expired, item.(*dbItem))
+			}, func(item *dbItem) bool {
+				expired = append(expired, item)
 				return true
 			})
 			if onExpired == nil && onExpiredSync == nil {
@@ -741,8 +741,7 @@ func (db *DB) Shrink() error {
 			done = true
 			var n int
 			btreeAscendGreaterOrEqual(db.keys, &dbItem{key: pivot},
-				func(item interface{}) bool {
-					dbi := item.(*dbItem)
+				func(dbi *dbItem) bool {
 					// 1000 items or 64MB buffer
 					if n > 1000 || len(buf) > 64*1024*1024 {
 						pivot = dbi.key
@@ -901,6 +900,19 @@ const minLoadGrowth = 64 * 1024
 // does not pin its memory.
 const maxRetainedBuf = 64 << 20
 
+// readRESPLine borrows the reader's buffer for ordinary headers, which are
+// parsed before the next read. Preserve support for longer headers by copying
+// the first fragment before ReadBytes reuses that buffer.
+func readRESPLine(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadSlice('\n')
+	if err != bufio.ErrBufferFull {
+		return line, err
+	}
+	prefix := append([]byte(nil), line...)
+	rest, err := r.ReadBytes('\n')
+	return append(prefix, rest...), err
+}
+
 // parseRESPLen parses the numeric portion of a RESP header line such as
 // "*3\r\n" or "$12\r\n". The length is untrusted input, so non-digits and
 // arithmetic overflow are rejected rather than wrapping to a negative value.
@@ -966,6 +978,21 @@ func readGrowing(r io.Reader, data []byte, need int) ([]byte, error) {
 	return data, nil
 }
 
+// loadCommand returns the command name as a string literal when it is set, del
+// or flushdb in any ASCII letter case, so the loader does not allocate it. Any
+// other name is copied, and the loader rejects it.
+func loadCommand(b []byte) string {
+	switch {
+	case len(b) == 3 && b[0]|0x20 == 's' && b[1]|0x20 == 'e' && b[2]|0x20 == 't':
+		return "set"
+	case len(b) == 3 && b[0]|0x20 == 'd' && b[1]|0x20 == 'e' && b[2]|0x20 == 'l':
+		return "del"
+	case len(b) == 7 && strings.EqualFold(string(b), "flushdb"):
+		return "flushdb"
+	}
+	return string(b)
+}
+
 // readLoad reads from the reader and loads commands into the database.
 // modTime is the modified time of the reader. A modTime after time.Now() is
 // treated as time.Now(), so a legacy "ex" TTL never grows from a future mtime.
@@ -1005,7 +1032,7 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		// read a single command.
 		// first we should read the number of parts that the of the command
 		cmdByteSize := int64(0)
-		line, err := r.ReadBytes('\n')
+		line, err := readRESPLine(r)
 		if err != nil {
 			return totalSize, err
 		}
@@ -1023,7 +1050,7 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		parts = parts[:0]
 		for i := 0; i < count; i++ {
 			// read the number of bytes of the part.
-			line, err := r.ReadBytes('\n')
+			line, err := readRESPLine(r)
 			if err != nil {
 				return totalSize, err
 			}
@@ -1057,8 +1084,12 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			if data[size] != '\r' || data[size+1] != '\n' {
 				return totalSize, ErrInvalid
 			}
-			// copy string
-			parts = append(parts, string(data[:size]))
+			// copy string; the command name is a literal, not a copy
+			if i == 0 {
+				parts = append(parts, loadCommand(data[:size]))
+			} else {
+				parts = append(parts, string(data[:size]))
+			}
 			cmdByteSize += int64(size + 2)
 		}
 		// finished reading the command
@@ -1068,15 +1099,10 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			pending = 0
 			continue
 		}
-		// Each command is matched by exact length, then by byte. The length
-		// check restores the guard commit f240a9c had and b559e28 dropped to
-		// admit the seven-character "flushdb": without it, indexing parts[0]
-		// panicked on a shorter name. It also keeps matching ASCII-only, so a
-		// multi-byte look-alike such as "ſet" (U+017F) cannot pass as SET.
-		if len(parts[0]) == 3 &&
-			(parts[0][0] == 's' || parts[0][0] == 'S') &&
-			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
-			(parts[0][2] == 't' || parts[0][2] == 'T') {
+		// loadCommand already matched the command name, ASCII-only and in any
+		// letter case, so a multi-byte look-alike such as "ſet" (U+017F)
+		// cannot pass as SET.
+		if parts[0] == "set" {
 			// SET
 			if len(parts) < 3 || len(parts) == 4 || len(parts) > 5 {
 				return totalSize, ErrInvalid
@@ -1126,19 +1152,14 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			} else {
 				db.insertIntoDatabase(&dbItem{key: parts[1], val: parts[2]})
 			}
-		} else if len(parts[0]) == 3 &&
-			(parts[0][0] == 'd' || parts[0][0] == 'D') &&
-			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
-			(parts[0][2] == 'l' || parts[0][2] == 'L') {
+		} else if parts[0] == "del" {
 			// DEL
 			if len(parts) != 2 {
 				return totalSize, ErrInvalid
 			}
 			db.deleteFromDatabase(&dbItem{key: parts[1]})
-		} else if len(parts[0]) == 7 && strings.EqualFold(parts[0], "flushdb") {
-			db.keys = btreeNew(lessCtx(nil))
-			db.exps = btreeNew(lessCtx(&exctx{db}))
-			db.idxs = make(map[string]*index)
+		} else if parts[0] == "flushdb" {
+			db.initTrees()
 		} else {
 			return totalSize, ErrInvalid
 		}
@@ -1196,11 +1217,9 @@ func (db *DB) load() error {
 		return err
 	}
 	var estaofsz int64
-	db.keys.Walk(func(items []interface{}) {
-		for _, v := range items {
-			estaofsz += int64(v.(*dbItem).estAOFSetSize())
-		}
-	})
+	for v := range db.keys.All() {
+		estaofsz += int64(v.estAOFSetSize())
+	}
 	db.lastaofsz += estaofsz
 	return nil
 }
@@ -1274,11 +1293,7 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 
 // get return an item or nil if not found.
 func (db *DB) get(key string) *dbItem {
-	item := db.keys.Get(&dbItem{key: key})
-	if item != nil {
-		return item.(*dbItem)
-	}
-	return nil
+	return db.keys.Get(&dbItem{key: key})
 }
 
 // Tx represents a transaction on the database. This transaction can either be
@@ -1296,8 +1311,8 @@ type Tx struct {
 
 type txWriteContext struct {
 	// rollback when deleteAll is called
-	rbkeys *btree.BTree      // a tree of all item ordered by key
-	rbexps *btree.BTree      // a tree of items ordered by expiration
+	rbkeys *dbTree           // a tree of all item ordered by key
+	rbexps *dbTree           // a tree of items ordered by expiration
 	rbidxs map[string]*index // the index trees.
 
 	rollbackItems   map[string]*dbItem // details for rolling back tx.
@@ -1326,8 +1341,8 @@ func (tx *Tx) DeleteAll() error {
 
 	// now reset the live database trees
 	idxs := tx.db.idxs
-	tx.db.keys = btreeNew(lessCtx(nil))
-	tx.db.exps = btreeNew(lessCtx(&exctx{tx.db}))
+	tx.db.keys = btreeNew(lessByKey)
+	tx.db.exps = btreeNew(lessExps)
 	tx.db.idxs = make(map[string]*index, len(idxs))
 
 	// finally re-create the current indexes, not the ones saved for rollback
@@ -1697,45 +1712,43 @@ func (dbi *dbItem) expiresAt() time.Time {
 	return dbi.opts.exat
 }
 
-// Less determines if a b-tree item is less than another. This is required
-// for ordering, inserting, and deleting items from a b-tree. It's important
-// to note that the ctx parameter is used to help with determine which
-// formula to use on an item. Each b-tree should use a different ctx when
-// sharing the same item.
-func (dbi *dbItem) Less(dbi2 *dbItem, ctx interface{}) bool {
-	switch ctx := ctx.(type) {
-	case *exctx:
-		// The expires b-tree formula
-		if dbi2.expiresAt().After(dbi.expiresAt()) {
-			return true
-		}
-		if dbi.expiresAt().After(dbi2.expiresAt()) {
-			return false
-		}
-	case *index:
-		if ctx.less != nil {
-			// Using an index
-			if ctx.less(dbi.val, dbi2.val) {
-				return true
-			}
-			if ctx.less(dbi2.val, dbi.val) {
-				return false
-			}
-		}
-	}
-	// Always fall back to the key comparison. This creates absolute uniqueness.
-	if dbi.keyless {
+// lessByKey orders items by key. It is the keys tree's comparator and the
+// final tie-break for every other tree, which is what keeps each item unique
+// within an index. A keyless item sorts after every real item with the same
+// value, so a {val: x, keyless: true} pivot lands past the end of x's run.
+func lessByKey(a, b *dbItem) bool {
+	if a.keyless {
 		return false
-	} else if dbi2.keyless {
+	} else if b.keyless {
 		return true
 	}
-	return dbi.key < dbi2.key
+	return a.key < b.key
 }
 
-func lessCtx(ctx interface{}) func(a, b interface{}) bool {
-	return func(a, b interface{}) bool {
-		return a.(*dbItem).Less(b.(*dbItem), ctx)
+// lessExps orders the expiration tree: soonest expiry first, then by key.
+func lessExps(a, b *dbItem) bool {
+	ea, eb := a.expiresAt(), b.expiresAt()
+	if eb.After(ea) {
+		return true
 	}
+	if ea.After(eb) {
+		return false
+	}
+	return lessByKey(a, b)
+}
+
+// lessItems is the comparator for this index's b-tree: the index's less
+// function on values, then key as the tie-break.
+func (idx *index) lessItems(a, b *dbItem) bool {
+	if idx.less != nil {
+		if idx.less(a.val, b.val) {
+			return true
+		}
+		if idx.less(b.val, a.val) {
+			return false
+		}
+	}
+	return lessByKey(a, b)
 }
 
 // Rect converts a string to a rectangle.
@@ -1932,14 +1945,13 @@ func (tx *Tx) scan(desc, gt, lt bool, index, start, stop string,
 		return ErrTxClosed
 	}
 	// wrap a btree specific iterator around the user-defined iterator.
-	iter := func(item interface{}) bool {
-		dbi := item.(*dbItem)
+	iter := func(dbi *dbItem) bool {
 		if dbi.expired() {
 			return true
 		}
 		return iterator(dbi.key, dbi.val)
 	}
-	var tr *btree.BTree
+	var tr *dbTree
 	if index == "" {
 		// empty index means we will use the keys tree.
 		tr = tx.db.keys
@@ -2671,72 +2683,103 @@ func Desc(less func(a, b string) bool) func(a, b string) bool {
 
 //// Wrappers around btree Ascend/Descend
 
-func bLT(tr *btree.BTree, a, b interface{}) bool { return tr.Less(a, b) }
-func bGT(tr *btree.BTree, a, b interface{}) bool { return tr.Less(b, a) }
+// dbTree is the b-tree behind the keys, expiration and index trees: a v2
+// Table on *dbItem. The Table keeps its comparator private, so the tree keeps
+// a copy for bLT and bGT.
+type dbTree struct {
+	*btree.Table[*dbItem]
+	less func(a, b *dbItem) bool
+}
 
-// func bLTE(tr *btree.BTree, a, b interface{}) bool { return !tr.Less(b, a) }
-// func bGTE(tr *btree.BTree, a, b interface{}) bool { return !tr.Less(a, b) }
+func bLT(tr *dbTree, a, b *dbItem) bool { return tr.less(a, b) }
+func bGT(tr *dbTree, a, b *dbItem) bool { return tr.less(b, a) }
+
+// walk calls iter for each item of seq until iter returns false.
+func walk(seq iter.Seq[*dbItem], iter func(item *dbItem) bool) {
+	for item := range seq {
+		if !iter(item) {
+			return
+		}
+	}
+}
+
+// ascendFrom and descendFrom start at pivot. A nil pivot starts at the end of
+// the tree, as in btree v1; v2 would pass it to the comparator.
+func ascendFrom(tr *dbTree, pivot *dbItem) iter.Seq[*dbItem] {
+	if pivot == nil {
+		return tr.All()
+	}
+	return tr.Ascend(pivot)
+}
+
+func descendFrom(tr *dbTree, pivot *dbItem) iter.Seq[*dbItem] {
+	if pivot == nil {
+		return tr.Backward()
+	}
+	return tr.Descend(pivot)
+}
 
 // Ascend
 
-func btreeAscend(tr *btree.BTree, iter func(item interface{}) bool) {
-	tr.Ascend(nil, iter)
+func btreeAscend(tr *dbTree, iter func(item *dbItem) bool) {
+	walk(tr.All(), iter)
 }
 
-func btreeAscendLessThan(tr *btree.BTree, pivot interface{},
-	iter func(item interface{}) bool,
+func btreeAscendLessThan(tr *dbTree, pivot *dbItem,
+	iter func(item *dbItem) bool,
 ) {
-	tr.Ascend(nil, func(item interface{}) bool {
+	walk(tr.All(), func(item *dbItem) bool {
 		return bLT(tr, item, pivot) && iter(item)
 	})
 }
 
-func btreeAscendGreaterOrEqual(tr *btree.BTree, pivot interface{},
-	iter func(item interface{}) bool,
+func btreeAscendGreaterOrEqual(tr *dbTree, pivot *dbItem,
+	iter func(item *dbItem) bool,
 ) {
-	tr.Ascend(pivot, iter)
+	walk(ascendFrom(tr, pivot), iter)
 }
 
-func btreeAscendRange(tr *btree.BTree, greaterOrEqual, lessThan interface{},
-	iter func(item interface{}) bool,
+func btreeAscendRange(tr *dbTree, greaterOrEqual, lessThan *dbItem,
+	iter func(item *dbItem) bool,
 ) {
-	tr.Ascend(greaterOrEqual, func(item interface{}) bool {
+	walk(ascendFrom(tr, greaterOrEqual), func(item *dbItem) bool {
 		return bLT(tr, item, lessThan) && iter(item)
 	})
 }
 
 // Descend
 
-func btreeDescend(tr *btree.BTree, iter func(item interface{}) bool) {
-	tr.Descend(nil, iter)
+func btreeDescend(tr *dbTree, iter func(item *dbItem) bool) {
+	walk(tr.Backward(), iter)
 }
 
-func btreeDescendGreaterThan(tr *btree.BTree, pivot interface{},
-	iter func(item interface{}) bool,
+func btreeDescendGreaterThan(tr *dbTree, pivot *dbItem,
+	iter func(item *dbItem) bool,
 ) {
-	tr.Descend(nil, func(item interface{}) bool {
+	walk(tr.Backward(), func(item *dbItem) bool {
 		return bGT(tr, item, pivot) && iter(item)
 	})
 }
 
-func btreeDescendRange(tr *btree.BTree, lessOrEqual, greaterThan interface{},
-	iter func(item interface{}) bool,
+func btreeDescendRange(tr *dbTree, lessOrEqual, greaterThan *dbItem,
+	iter func(item *dbItem) bool,
 ) {
-	tr.Descend(lessOrEqual, func(item interface{}) bool {
+	walk(descendFrom(tr, lessOrEqual), func(item *dbItem) bool {
 		return bGT(tr, item, greaterThan) && iter(item)
 	})
 }
 
-func btreeDescendLessOrEqual(tr *btree.BTree, pivot interface{},
-	iter func(item interface{}) bool,
+func btreeDescendLessOrEqual(tr *dbTree, pivot *dbItem,
+	iter func(item *dbItem) bool,
 ) {
-	tr.Descend(pivot, iter)
+	walk(descendFrom(tr, pivot), iter)
 }
 
-func btreeNew(less func(a, b interface{}) bool) *btree.BTree {
-	// NoLocks because we're managing our own locks. Degree 128 keeps the
-	// btree v1.4.2 node layout (at most 255 items per node). The v1.8.2 default
-	// of 32 failed the memory gate (+5.9% plain, +16.8% index); the evidence is
-	// in bench/round12/step6a-u1/.
-	return btree.NewOptions(less, btree.Options{NoLocks: true, Degree: 128})
+// btreeNew returns an empty tree. v2 has no locks to turn off, and a fixed
+// fanout of 64 (at most 63 items per node), so the Degree 128 of btree v1.8.2
+// is not available. Retained memory is still below v1.8.2 with Degree 128,
+// because the typed tree stores 8-byte item slots: 0.954 (plain), 0.892 (TTL)
+// and 0.650 (secondary index) of it, in bench/round12/step7/mem-gate-u2.txt.
+func btreeNew(less func(a, b *dbItem) bool) *dbTree {
+	return &dbTree{btree.NewTableOptions(btree.TableOptions[*dbItem]{Less: less}), less}
 }

@@ -166,6 +166,35 @@ func TestControlCommandNameCase(t *testing.T) {
 	}
 }
 
+// P1c V1: loadCommand returns the command name as a literal, so loading a
+// set, del or flushdb record does not allocate the name. Every letter case of
+// the three names must match without allocating; anything else still gets a
+// copy and the loader rejects it.
+func TestLoadCommandNoAlloc(t *testing.T) {
+	for _, name := range []string{"set", "del", "flushdb"} {
+		for mask := 0; mask < 1<<len(name); mask++ {
+			b := []byte(name)
+			for i := range b {
+				if mask>>i&1 == 1 {
+					b[i] -= 'a' - 'A'
+				}
+			}
+			var got string
+			if n := testing.AllocsPerRun(100, func() { got = loadCommand(b) }); n != 0 {
+				t.Errorf("loadCommand(%q) allocates %v times, want 0", b, n)
+			}
+			if got != name {
+				t.Errorf("loadCommand(%q) = %q, want %q", b, got, name)
+			}
+		}
+	}
+	for _, in := range []string{"", "s", "get", "sets", "ſet", "flushdb ", "flushda", "SE\x00", "de\xcc"} {
+		if got := loadCommand([]byte(in)); got != in {
+			t.Errorf("loadCommand(%q) = %q, want the input unchanged", in, got)
+		}
+	}
+}
+
 // RESP command names are ASCII; Unicode case folding must not turn malformed
 // input into a command, particularly a destructive FLUSHDB.
 func TestControlASCIICommandNames(t *testing.T) {
@@ -192,9 +221,7 @@ func TestControlASCIICommandNames(t *testing.T) {
 // initialised; it does not need a file or a background manager.
 func newLoadTarget() *DB {
 	db := &DB{}
-	db.keys = btreeNew(lessCtx(nil))
-	db.exps = btreeNew(lessCtx(&exctx{db}))
-	db.idxs = make(map[string]*index)
+	db.initTrees()
 	return db
 }
 
@@ -689,11 +716,9 @@ func TestControlLoadOffsetExcludesTrailingNULs(t *testing.T) {
 // loadedKeys lists the keys in db's b-tree, in order.
 func loadedKeys(db *DB) []string {
 	var keys []string
-	db.keys.Walk(func(items []interface{}) {
-		for _, v := range items {
-			keys = append(keys, v.(*dbItem).key)
-		}
-	})
+	for v := range db.keys.All() {
+		keys = append(keys, v.key)
+	}
 	return keys
 }
 
@@ -1643,8 +1668,7 @@ func dbState(t *testing.T, db *DB) string {
 		if err != nil {
 			return err
 		}
-		btreeAscend(tx.db.exps, func(item any) bool {
-			dbi := item.(*dbItem)
+		btreeAscend(tx.db.exps, func(dbi *dbItem) bool {
 			fmt.Fprintf(&sb, "exp %s exat=%d\n", dbi.key, dbi.opts.exat.UnixNano())
 			return true
 		})
@@ -2293,4 +2317,113 @@ func TestRegressJSONIndexModifierChild(t *testing.T) {
 		t.Fatalf("unknown mode %q", mode)
 	}
 	checkJSONPairs(t, want)
+}
+
+// TestBTreeAdapterMatrix checks the range helpers over the b-tree against a
+// sorted slice: bounds present in the tree and absent from it, nil starting
+// pivots, empty ranges (start past end, and equal), and an early stop. The tree
+// is an index tree with five values of 60 items each, so a run of equal values
+// spans several 63-item nodes.
+func TestBTreeAdapterMatrix(t *testing.T) {
+	idx := &index{less: func(a, b string) bool { return a < b }}
+	tr := btreeNew(idx.lessItems)
+	var all []*dbItem
+	for i := range 300 {
+		it := &dbItem{key: fmt.Sprintf("k%03d", i), val: strconv.Itoa(i % 5)}
+		tr.Set(it)
+		all = append(all, it)
+	}
+	less := tr.less
+	slices.SortFunc(all, func(a, b *dbItem) int {
+		switch {
+		case less(a, b):
+			return -1
+		case less(b, a):
+			return 1
+		}
+		return 0
+	})
+	rev := slices.Clone(all)
+	slices.Reverse(rev)
+	pivots := []*dbItem{
+		all[0], all[1], all[59], all[60], all[61], all[150], all[299], // in the tree
+		{val: "", key: ""}, {val: "2", key: "k150x"}, {val: "2", keyless: true}, {val: "9", key: "a"}, // not in it
+	}
+	type op struct {
+		name     string
+		desc     bool
+		nilStart bool // the starting pivot p may be nil
+		two      bool // takes an end bound q
+		run      func(p, q *dbItem, f func(*dbItem) bool)
+		keep     func(x, p, q *dbItem) bool // p is nil for an unbounded start
+	}
+	ops := []op{
+		{"Ascend", false, false, false, func(p, q *dbItem, f func(*dbItem) bool) { btreeAscend(tr, f) },
+			func(x, p, q *dbItem) bool { return true }},
+		{"AscendLessThan", false, false, false, func(p, q *dbItem, f func(*dbItem) bool) { btreeAscendLessThan(tr, p, f) },
+			func(x, p, q *dbItem) bool { return less(x, p) }},
+		{"AscendGreaterOrEqual", false, true, false, func(p, q *dbItem, f func(*dbItem) bool) { btreeAscendGreaterOrEqual(tr, p, f) },
+			func(x, p, q *dbItem) bool { return p == nil || !less(x, p) }},
+		{"AscendRange", false, true, true, func(p, q *dbItem, f func(*dbItem) bool) { btreeAscendRange(tr, p, q, f) },
+			func(x, p, q *dbItem) bool { return (p == nil || !less(x, p)) && less(x, q) }},
+		{"Descend", true, false, false, func(p, q *dbItem, f func(*dbItem) bool) { btreeDescend(tr, f) },
+			func(x, p, q *dbItem) bool { return true }},
+		{"DescendGreaterThan", true, false, false, func(p, q *dbItem, f func(*dbItem) bool) { btreeDescendGreaterThan(tr, p, f) },
+			func(x, p, q *dbItem) bool { return less(p, x) }},
+		{"DescendLessOrEqual", true, true, false, func(p, q *dbItem, f func(*dbItem) bool) { btreeDescendLessOrEqual(tr, p, f) },
+			func(x, p, q *dbItem) bool { return p == nil || !less(p, x) }},
+		{"DescendRange", true, true, true, func(p, q *dbItem, f func(*dbItem) bool) { btreeDescendRange(tr, p, q, f) },
+			func(x, p, q *dbItem) bool { return (p == nil || !less(p, x)) && less(q, x) }},
+	}
+	for _, o := range ops {
+		ps := pivots
+		if o.nilStart {
+			ps = append([]*dbItem{nil}, pivots...)
+		}
+		qs := []*dbItem{nil}
+		if o.two {
+			qs = pivots
+		}
+		src := all
+		if o.desc {
+			src = rev
+		}
+		for _, p := range ps {
+			for _, q := range qs {
+				var want []*dbItem
+				for _, x := range src {
+					if o.keep(x, p, q) {
+						want = append(want, x)
+					}
+				}
+				for _, stop := range []int{-1, 1, 70} { // -1: run to the end
+					var got []*dbItem
+					calls := 0
+					o.run(p, q, func(x *dbItem) bool {
+						calls++
+						got = append(got, x)
+						return calls != stop
+					})
+					w := want
+					if stop > 0 && len(w) > stop {
+						w = w[:stop]
+					}
+					if !slices.Equal(got, w) || calls != len(w) {
+						i := 0
+						for i < min(len(got), len(w)) && got[i] == w[i] {
+							i++
+						}
+						at := func(s []*dbItem) string {
+							if i < len(s) {
+								return s[i].key + "=" + s[i].val
+							}
+							return "<end>"
+						}
+						t.Fatalf("%s p=%+v q=%+v stop=%d: got %d items in %d calls, want %d; first difference at %d: got %s, want %s",
+							o.name, p, q, stop, len(got), calls, len(w), i, at(got), at(w))
+					}
+				}
+			}
+		}
+	}
 }
