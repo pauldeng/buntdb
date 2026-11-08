@@ -8,6 +8,10 @@ on:
   # Manual runs from the Actions tab, e.g. to re-verify without a new commit.
   workflow_dispatch:
 
+# The jobs only read the repository.
+permissions:
+  contents: read
+
 env:
   # Use exactly the toolchain setup-go installed; fail loudly rather than
   # silently downloading a different one.
@@ -28,10 +32,10 @@ jobs:
     steps:
     # Checkout must precede setup-go: go-version-file reads go.mod.
     - name: Check out code
-      uses: actions/checkout@v5
+      uses: actions/checkout@v7
 
     - name: Set up Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
         # Exactly one version selector. Supplying go-version as well would
         # override this file.
