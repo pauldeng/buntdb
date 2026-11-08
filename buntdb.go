@@ -1,7 +1,10 @@
 // Package buntdb implements a low-level in-memory key/value store in pure Go.
-// It persists to disk, is ACID compliant, and uses locking for multiple
-// readers and a single writer. Bunt is ideal for projects that need a
-// dependable database, and favor speed over data size.
+//
+// It persists to disk and is ACID compliant. It uses locking for multiple
+// readers and one writer.
+//
+// BuntDB is ideal for projects that need a dependable database and favor speed
+// over data size.
 package buntdb
 
 import (
@@ -29,45 +32,60 @@ import (
 )
 
 var (
-	// ErrTxNotWritable is returned when performing a write operation on a
-	// read-only transaction.
+	// ErrTxNotWritable is the error that a write operation returns in a read-only
+	// transaction. Commit returns it for a read-only transaction.
 	ErrTxNotWritable = errors.New("tx not writable")
 
-	// ErrTxClosed is returned when committing or rolling back a transaction
-	// that has already been committed or rolled back.
+	// ErrTxClosed is the error that an operation returns when its transaction
+	// already ended with Commit or Rollback.
 	ErrTxClosed = errors.New("tx closed")
 
-	// ErrNotFound is returned when an item or index is not in the database.
+	// ErrNotFound is the error that an operation returns when an index or item is
+	// not in the database, or when an item has expired. An operation also returns
+	// it when the index has no less function or rect function that the operation
+	// needs.
 	ErrNotFound = errors.New("not found")
 
-	// ErrInvalid is returned when the database file is an invalid format.
+	// ErrInvalid is the error that Open and Load return when the data has an
+	// invalid format.
 	ErrInvalid = errors.New("invalid database")
 
-	// ErrDatabaseClosed is returned when the database is closed.
+	// ErrDatabaseClosed is the error that an operation returns when the database
+	// is closed.
 	ErrDatabaseClosed = errors.New("database closed")
 
-	// ErrIndexExists is returned when an index already exists in the database.
+	// ErrIndexExists is the error that the index-creating functions return when
+	// an index with the same name exists, or when the name is empty.
 	ErrIndexExists = errors.New("index exists")
 
-	// ErrInvalidOperation is returned when an operation cannot be completed.
+	// ErrInvalidOperation is the error that DropIndex, ReplaceIndex and
+	// ReplaceSpatialIndex return when the index name is empty.
 	ErrInvalidOperation = errors.New("invalid operation")
 
-	// ErrInvalidSyncPolicy is returned for an invalid SyncPolicy value.
+	// ErrInvalidSyncPolicy is the error that SetConfig returns when SyncPolicy is
+	// not Never, EverySecond or Always.
 	ErrInvalidSyncPolicy = errors.New("invalid sync policy")
 
-	// ErrShrinkInProcess is returned when a shrink operation is in-process.
+	// ErrShrinkInProcess is the error that Shrink returns when another Shrink is
+	// running.
 	ErrShrinkInProcess = errors.New("shrink is in-process")
 
-	// ErrPersistenceActive is returned when post-loading data from an database
-	// not opened with Open(":memory:").
+	// ErrPersistenceActive is the error that Load returns when the database
+	// persists to disk. Only an in-memory database, from Open(":memory:"),
+	// accepts Load.
 	ErrPersistenceActive = errors.New("persistence active")
 
-	// ErrTxIterating is returned when Set or Delete are called while iterating.
+	// ErrTxIterating is the error that a write operation returns inside an
+	// iteration callback. Set, Delete, DeleteAll, DropIndex and the
+	// index-creating functions return it while an Ascend, Descend, Intersects or
+	// Nearby callback runs. In a read-only transaction, these operations return
+	// ErrTxNotWritable instead.
 	ErrTxIterating = errors.New("tx is iterating")
 )
 
-// DB represents a collection of key-value pairs that persist on disk.
-// Transactions are used for all forms of data access to the DB.
+// DB is a collection of items. An item is a key and its value. A transaction
+// gives all access to the items of a DB. A DB persists to a database file,
+// unless Open receives the path ":memory:".
 type DB struct {
 	mu        sync.RWMutex      // the gatekeeper for all fields, except synced
 	file      *os.File          // the underlying file
@@ -87,57 +105,69 @@ type DB struct {
 	lastaofsz int64             // the size of the last shrink aof size
 }
 
-// SyncPolicy represents how often data is synced to disk.
+// SyncPolicy sets how often BuntDB syncs the database file to disk. A sync
+// asks the operating system to write the file data to the storage device. On
+// Unix, it is an fsync call.
 type SyncPolicy int
 
 const (
-	// Never is used to disable syncing data to disk.
-	// The faster and less safe method.
+	// Never does not sync the database file after a commit or in the background.
+	// The operating system decides when it writes the data to disk. Close and
+	// DB.Sync still sync the file. This policy is the fastest and the least safe.
 	Never SyncPolicy = 0
-	// EverySecond is used to sync data to disk every second.
-	// It's pretty fast and you can lose 1 second of data if there
-	// is a disaster.
-	// This is the recommended setting.
+	// EverySecond syncs the database file in the background about once each
+	// second, when a commit still needs a sync. The background task can run late,
+	// so the policy guarantees no maximum loss window. A crash can lose the
+	// commits since the last sync. This policy is the default.
 	EverySecond = 1
-	// Always is used to sync data after every write to disk.
-	// Slow. Very safe.
-	// A failed sync is returned from Commit. See Commit for what that does
-	// and does not promise.
+	// Always syncs the database file after every commit that writes to the file.
+	// This policy is the slowest and the safest. Commit returns a failed sync.
+	// See Commit for what that error means.
 	Always = 2
 )
 
-// Config represents database configuration options. These
-// options are used to change various behaviors of the database.
+// Config holds the configuration options of a database. The options change how
+// the database behaves.
 type Config struct {
-	// SyncPolicy adjusts how often the data is synced to disk.
-	// This value can be Never, EverySecond, or Always.
-	// The default is EverySecond.
+	// SyncPolicy sets how often BuntDB syncs the database file to disk. The value
+	// is Never, EverySecond or Always. Open sets EverySecond.
 	SyncPolicy SyncPolicy
 
-	// AutoShrinkPercentage is used by the background process to trigger
-	// a shrink of the aof file when the size of the file is larger than the
-	// percentage of the result of the previous shrunk file.
-	// For example, if this value is 100, and the last shrink process
-	// resulted in a 100mb file, then the new aof file must be 200mb before
-	// a shrink is triggered.
+	// AutoShrinkPercentage sets when the background task shrinks the database
+	// file. The task shrinks the file when it grows by more than this percentage
+	// of its size after the previous shrink.
+	//
+	// For example, assume the value is 100 and the previous shrink made a 100 MiB
+	// file. The file must then be larger than 200 MiB before a shrink starts.
+	//
+	// A value of zero or less means that any growth qualifies. The file must also
+	// be larger than AutoShrinkMinSize. Open sets 100.
 	AutoShrinkPercentage int
 
-	// AutoShrinkMinSize defines the minimum size of the aof file before
-	// an automatic shrink can occur.
+	// AutoShrinkMinSize sets the size, in bytes, that the database file must
+	// exceed before the background task can shrink it. Open sets 32 MiB.
 	AutoShrinkMinSize int
 
-	// AutoShrinkDisabled turns off automatic background shrinking
+	// AutoShrinkDisabled turns off automatic background shrinking. Open sets
+	// false.
 	AutoShrinkDisabled bool
 
-	// OnExpired is used to custom handle the deletion option when a key
-	// has been expired.
+	// OnExpired is an optional callback that receives the keys of expired items.
+	// The background task calls it outside any transaction.
+	//
+	// BuntDB does not delete the expired items when OnExpired is set. The
+	// callback controls them. It can delete an item, set it again with a new TTL,
+	// or set it again without a TTL. At each run, the task reports the items that
+	// are still expired.
 	OnExpired func(keys []string)
 
-	// OnExpiredSync will be called inside the same transaction that is
-	// performing the deletion of expired items. If OnExpired is present then
-	// this callback will not be called. If this callback is present, then the
-	// deletion of the timed-out item is the explicit responsibility of this
-	// callback.
+	// OnExpiredSync is an optional callback that the background task calls for
+	// each expired item. It runs inside the transaction that handles the expired
+	// items. BuntDB does not call it when OnExpired is set.
+	//
+	// BuntDB does not delete the item. The callback controls it through tx. It
+	// can delete the item, set it again with a new TTL, or set it again without a
+	// TTL. If the callback returns an error, BuntDB rolls back the transaction.
 	OnExpiredSync func(key, value string, tx *Tx) error
 }
 
@@ -149,8 +179,15 @@ func (db *DB) initTrees() {
 	db.idxs = make(map[string]*index)
 }
 
-// Open opens a database at the provided path.
-// If the file does not exist then it will be created automatically.
+// Open opens the database at path. It creates the database file, with mode
+// 0666 before the umask, if the file does not exist. The path ":memory:" opens
+// a database that does not persist to disk.
+//
+// Open replays the file into the item trees. If the file ends in the middle of
+// a command, Open truncates the file after the last complete command. If the
+// file has an invalid format, Open returns ErrInvalid.
+//
+// Open starts a background task. The task runs about once each second.
 func Open(path string) (*DB, error) {
 	db := &DB{}
 	// initialize trees and indexes
@@ -201,12 +238,16 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
-// Close releases all database resources.
-// All transactions must be closed before closing the database.
-// Close syncs the file before closing it.
-// Close releases every resource even when the sync or close fails.
-// Close returns any error from syncing or closing the file.
-// Close returns ErrDatabaseClosed if the database is already closed.
+// Close shuts down the database. For a database that persists to disk, it
+// syncs the database file and then closes the file. It also releases the item
+// and index trees.
+//
+// Close waits for open transactions to end. Do not call Close inside a
+// transaction.
+//
+// If the sync or the close fails, Close returns the error, or both errors
+// joined. In all cases, the database is closed afterward. Close returns
+// ErrDatabaseClosed if the database is already closed.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -222,10 +263,13 @@ func (db *DB) Close() error {
 	return err
 }
 
-// Save writes a snapshot of the database to a writer. This operation blocks all
-// writes, but not reads. This can be used for snapshots and backups for pure
-// in-memory databases using the ":memory:". Database that persist to disk
-// can be snapshotted by simply copying the database file.
+// Save writes a snapshot of the database to wr. Save blocks writes, but not
+// reads, while it runs. It returns the first error from wr.
+//
+// Use Save to back up a database. It works for in-memory databases and for
+// databases that persist to disk. A copy of the database file of a live
+// database can hold a partial transaction. Copy the file only when the
+// database is closed.
 //
 // Save returns ErrDatabaseClosed if the database is closed.
 func (db *DB) Save(wr io.Writer) error {
@@ -263,9 +307,12 @@ func (db *DB) Save(wr io.Writer) error {
 	return nil
 }
 
-// Load loads commands from reader. This operation blocks all reads and writes.
-// Note that this can only work for fully in-memory databases opened with
-// Open(":memory:").
+// Load reads commands from rd into the database. Load blocks all reads and
+// writes while it runs.
+//
+// Load works only for a database that Open(":memory:") opened. If an error
+// stops Load, the database keeps the items that Load read before the error. If
+// rd ends in the middle of a command, Load returns io.ErrUnexpectedEOF.
 //
 // Load returns ErrDatabaseClosed if the database is closed. It checks this
 // before it returns ErrPersistenceActive.
@@ -358,21 +405,8 @@ func (idx *index) rebuild() {
 	})
 }
 
-// CreateIndex builds a new index and populates it with items.
-// The items are ordered in an b-tree and can be retrieved using the
-// Ascend* and Descend* methods.
-// An error will occur if an index with the same name already exists.
-//
-// When a pattern is provided, the index will be populated with
-// keys that match the specified pattern. This is a very simple pattern
-// match where '*' matches on any number characters and '?' matches on
-// any one character.
-// The less function compares if string 'a' is less than string 'b'.
-// It allows for indexes to create custom ordering. It's possible
-// that the strings may be textual or binary. It's up to the provided
-// less function to handle the content format and comparison.
-// There are some default less function that can be used such as
-// IndexString, IndexBinary, etc.
+// CreateIndex builds a new index in its own read/write transaction. See
+// Tx.CreateIndex for the arguments and the errors.
 func (db *DB) CreateIndex(name, pattern string,
 	less ...func(a, b string) bool) error {
 	return db.Update(func(tx *Tx) error {
@@ -380,10 +414,10 @@ func (db *DB) CreateIndex(name, pattern string,
 	})
 }
 
-// ReplaceIndex builds a new index and populates it with items.
-// The items are ordered in an b-tree and can be retrieved using the
-// Ascend* and Descend* methods.
-// If a previous index with the same name exists, that index will be deleted.
+// ReplaceIndex builds a new index and fills it with items, in its own
+// read/write transaction. If an index with the same name exists, ReplaceIndex
+// drops that index first. It returns ErrInvalidOperation if name is empty. See
+// Tx.CreateIndex for the arguments and the other errors.
 func (db *DB) ReplaceIndex(name, pattern string,
 	less ...func(a, b string) bool) error {
 	return db.Update(func(tx *Tx) error {
@@ -402,20 +436,8 @@ func (db *DB) ReplaceIndex(name, pattern string,
 	})
 }
 
-// CreateSpatialIndex builds a new index and populates it with items.
-// The items are organized in an r-tree and can be retrieved using the
-// Intersects method.
-// An error will occur if an index with the same name already exists.
-//
-// The rect function converts a string to a rectangle. The rectangle is
-// represented by two arrays, min and max. Both arrays may have a length
-// between 1 and 20, and both arrays must match in length. A length of 1 is a
-// one dimensional rectangle, and a length of 4 is a four dimension rectangle.
-// There is support for up to 20 dimensions.
-// The values of min must be less than the values of max at the same dimension.
-// Thus min[0] must be less-than-or-equal-to max[0].
-// The IndexRect is a default function that can be used for the rect
-// parameter.
+// CreateSpatialIndex builds a new spatial index in its own read/write
+// transaction. See Tx.CreateSpatialIndex for the arguments and the errors.
 func (db *DB) CreateSpatialIndex(name, pattern string,
 	rect func(item string) (min, max []float64)) error {
 	return db.Update(func(tx *Tx) error {
@@ -423,10 +445,11 @@ func (db *DB) CreateSpatialIndex(name, pattern string,
 	})
 }
 
-// ReplaceSpatialIndex builds a new index and populates it with items.
-// The items are organized in an r-tree and can be retrieved using the
-// Intersects method.
-// If a previous index with the same name exists, that index will be deleted.
+// ReplaceSpatialIndex builds a new spatial index and fills it with items, in
+// its own read/write transaction. If an index with the same name exists,
+// ReplaceSpatialIndex drops that index first. It returns ErrInvalidOperation
+// if name is empty. See Tx.CreateSpatialIndex for the arguments and the other
+// errors.
 func (db *DB) ReplaceSpatialIndex(name, pattern string,
 	rect func(item string) (min, max []float64)) error {
 	return db.Update(func(tx *Tx) error {
@@ -445,14 +468,15 @@ func (db *DB) ReplaceSpatialIndex(name, pattern string,
 	})
 }
 
-// DropIndex removes an index.
+// DropIndex removes an index, in its own read/write transaction. See
+// Tx.DropIndex for the errors.
 func (db *DB) DropIndex(name string) error {
 	return db.Update(func(tx *Tx) error {
 		return tx.DropIndex(name)
 	})
 }
 
-// Indexes returns a list of index names.
+// Indexes returns the names of the indexes in sorted order.
 func (db *DB) Indexes() ([]string, error) {
 	var names []string
 	var err = db.View(func(tx *Tx) error {
@@ -463,7 +487,8 @@ func (db *DB) Indexes() ([]string, error) {
 	return names, err
 }
 
-// ReadConfig returns the database configuration.
+// ReadConfig copies the database configuration to config. It returns
+// ErrDatabaseClosed if the database is closed.
 func (db *DB) ReadConfig(config *Config) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -474,7 +499,9 @@ func (db *DB) ReadConfig(config *Config) error {
 	return nil
 }
 
-// SetConfig updates the database configuration.
+// SetConfig replaces the database configuration. It returns
+// ErrInvalidSyncPolicy if SyncPolicy is not valid. It returns
+// ErrDatabaseClosed if the database is closed.
 func (db *DB) SetConfig(config Config) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -697,47 +724,59 @@ func (db *DB) ack(n int64) {
 	}
 }
 
-// Sync writes every committed change to disk with an fsync, then syncs the
-// directory that holds the file. Use it with the SyncPolicy Never or
-// EverySecond when you need durability at a known point.
+// Sync syncs the database file, and then syncs the directory that holds the
+// file. Use Sync with the SyncPolicy Never or EverySecond when you need
+// durability at a known point.
 //
 // When Sync returns nil, every write that committed before the call is in the
-// file on disk, and the directory entry of the file is on disk too. Each Sync
-// costs one file fsync and one directory fsync. The directory is the real
-// parent of the file. Open resolves it, and Shrink updates it when it replaces
-// a symlink with the file. The directory fsync exists on Linux
-// and other Unix systems; on other systems Sync syncs the file only. Sync does
-// not sync the ancestors of that directory; they must already be durable.
-// Close syncs the file, not the directory.
+// file on disk. On Unix, the directory entry of the file is on disk too.
 //
-// If the file fsync succeeds and the directory fsync fails, Sync returns the
-// directory error. The writes are in the file on disk, but the name may not
-// be. The background sync does not repeat the directory fsync. Call Sync again.
+// A Sync costs one file sync and then one directory sync. Sync runs them also
+// when no commit is unacknowledged. If the file sync fails, Sync skips the
+// directory sync. If Close or Shrink closes the file, Sync can make more file
+// sync attempts, as the last paragraphs describe. For an in-memory database,
+// Sync does nothing and returns nil.
 //
-// Call Sync outside a transaction. Inside Update it deadlocks, and inside View
-// it can deadlock when a writer waits. Sync does not block readers or writers
-// while it runs. A write that commits during the fsync may not be on disk. Sync always runs both fsyncs, also when
-// no commit is unacknowledged. It does nothing and returns nil for an
-// in-memory database.
+// The directory is the real parent of the file. Open resolves it. Shrink
+// updates it when it replaces a symlink with the file. The directory sync
+// exists on Linux and other Unix systems. On other systems, the directory sync
+// does nothing, and Sync syncs the file only. Sync does not sync the ancestors
+// of the directory. Those directories must already be durable. Close syncs the
+// file, not the directory.
+//
+// If the file sync succeeds and the directory sync fails, Sync returns the
+// directory error. The writes are then in the file on disk, but the directory
+// entry of the file can be missing from the disk. The background task does not
+// repeat the directory sync. Call Sync again.
+//
+// Call Sync outside a transaction. Inside Update, Sync deadlocks. Inside View,
+// Sync can deadlock when a writer waits. Sync holds no database lock during
+// the file sync and the directory sync. A write that commits while the file
+// sync runs can be missing from the file on disk.
 //
 // Sync returns ErrDatabaseClosed if the database is closed before the call, or
-// if Close finishes before the file fsync starts. If Shrink replaces the file
-// before the file fsync starts, Sync syncs the new file. It makes at most
-// three file fsync attempts, then returns the last error, or ErrDatabaseClosed
-// if the database is closed by then. If Close starts while the file fsync runs,
-// that fsync finishes and Sync returns its result, or the directory error.
+// if Close finishes before the file sync starts. If Shrink replaces the file
+// before the file sync starts, Sync syncs the new file. If the file sync fails
+// because Close or Shrink closed the file, Sync tries again. It makes at most
+// three attempts, and then returns the last error. It returns
+// ErrDatabaseClosed instead if the database is closed by then. If Close starts
+// while the file sync runs, that sync finishes. Sync then returns the result
+// of that sync, or the directory error.
 //
-// The database tracks the sync work conservatively, as acknowledged commit
-// counts. Each file fsync attempt reads the commit count just before it starts.
-// If the fsync succeeds, it acknowledges that count. A write that commits after
-// that read is not acknowledged by that attempt. After a retry, the call can
-// acknowledge a write that committed during the call. A concurrent Sync may
-// acknowledge a write that another call did not. A successful Shrink and an
-// Always fsync acknowledge nothing, so the background sync can still fsync once
-// for writes that are already on disk. With SyncPolicy EverySecond, the
-// background sync fsyncs the file while a commit is unacknowledged. If the file
-// fsync of Sync fails, it acknowledges nothing, so the next background sync
-// tries again. If every commit is acknowledged, a failed Sync is not retried.
+// The database counts the commits that a sync makes durable. It tracks them
+// conservatively, as acknowledged commit counts. Each file sync attempt reads
+// the commit count just before it starts. If the sync succeeds, it
+// acknowledges that count. That attempt does not acknowledge a write that
+// commits after the read. After a retry, the call can acknowledge a write that
+// committed during the call. A concurrent Sync can acknowledge a write that
+// another call does not.
+//
+// A successful Shrink and an Always sync acknowledge nothing. The background
+// task can then sync once for writes that are already on disk. With SyncPolicy
+// EverySecond, the background task syncs the file while a commit is
+// unacknowledged. If the file sync of Sync fails, it acknowledges nothing, so
+// the background task tries again. If a sync already acknowledged every
+// commit, nothing retries a failed Sync.
 func (db *DB) Sync() error { return db.syncWith((*os.File).Sync) }
 
 // syncAttempts is the most file fsync attempts that Sync makes when Close or
@@ -795,25 +834,38 @@ func shrinkDue(pos, last int64, pct int) bool {
 	return uint64(pos-last) > limit
 }
 
-// Shrink will make the database file smaller by removing redundant
-// log entries. This operation does not block the database.
+// Shrink makes the database file smaller. It writes a snapshot of the items,
+// one command for each item, and then appends the commands that commit while
+// it runs. It removes the earlier redundant commands.
+//
+// Shrink does not hold a lock for the whole operation. It reads the items in
+// chunks of about 1000 items, and holds the read lock for each chunk. At the
+// end, it holds the write lock while it copies the new commands and replaces
+// the file.
 //
 // Shrink writes the new file to a temporary file in the same directory. It
-// syncs that file before it replaces the old one, so a crash leaves either
-// the old file or the new file, complete.
+// syncs that file before it renames the file over the old one. The new file
+// then has complete contents when it replaces the old file. A directory sync
+// then makes the rename durable on Unix. On other systems, that sync does
+// nothing. The durability limits of SyncPolicy still apply to commits that no
+// sync covered.
 //
-// The new file keeps the permission bits of the old file. On Unix it also
-// keeps the owner and group, and on Linux the POSIX ACL. If Shrink cannot copy
-// the owner or the ACL, the new file gets at most mode 0600 and no ACL. Shrink
-// does not report this narrowing. If Shrink cannot remove an inherited ACL, it
-// returns the error and leaves the database open on the old file.
-// On Windows the new file inherits its DACL from the directory.
+// The new file keeps the permission bits of the old file. On Unix, it also
+// keeps the owner and the group. On Linux, it also keeps the POSIX ACL. If
+// Shrink cannot copy the owner or the ACL, the new file gets at most mode 0600
+// and no ACL. Shrink does not report this narrowing. If Shrink cannot remove
+// an inherited ACL, it returns the error and the database stays open on the
+// old file. On Windows, the new file inherits its DACL from the directory.
 // Shrink does not copy an explicit DACL from the old file.
 //
 // If a failed Shrink leaves the database file unusable, Shrink closes the
-// database and returns the error. Later calls return ErrDatabaseClosed.
-// Shrink never panics for this reason. If only the final directory sync
-// fails, the database stays open and uses the new file.
+// database and returns the error. Later calls return ErrDatabaseClosed. Shrink
+// does not panic for this reason. If only the final directory sync fails, the
+// database stays open and uses the new file.
+//
+// Shrink returns ErrShrinkInProcess if another Shrink is running. It returns
+// ErrDatabaseClosed if the database is closed. For an in-memory database, it
+// does nothing and returns nil.
 func (db *DB) Shrink() error {
 	db.mu.Lock()
 	if db.closed {
@@ -1396,34 +1448,29 @@ func (db *DB) managed(writable bool, fn func(tx *Tx) error) (err error) {
 	return
 }
 
-// View executes a function within a managed read-only transaction.
-// When a non-nil error is returned from the function that error will be return
-// to the caller of View().
+// View runs fn in a managed read-only transaction. View returns the error that
+// fn returns.
 //
-// If fn panics or calls runtime.Goexit, the transaction is rolled back.
-// Any panic continues to propagate to the caller.
+// If fn panics or calls runtime.Goexit, View rolls back the transaction. A
+// panic continues to propagate to the caller.
 //
-// Executing a manual commit or rollback from inside the function will result
-// in a panic.
+// A manual commit or rollback inside fn causes a panic.
 func (db *DB) View(fn func(tx *Tx) error) error {
 	return db.managed(false, fn)
 }
 
-// Update executes a function within a managed read/write transaction.
-// If fn returns an error, the transaction is rolled back and that error is
-// returned to the caller. If fn returns nil, the transaction is committed and
-// any error from Commit is returned.
+// Update runs fn in a managed read/write transaction. If fn returns an error,
+// Update rolls back the transaction and returns that error. If fn returns nil,
+// Update commits the transaction and returns any error from Commit.
 //
 // Under SyncPolicy Always, a sync error leaves the changes applied with
-// durability unconfirmed; it does not mean the transaction was rolled back.
-// See Commit before retrying a non-idempotent operation after an error.
+// durability unconfirmed. It does not mean that the transaction rolled back.
+// See Commit before you retry a non-idempotent operation after an error.
 //
-// The transaction is committed only when fn returns nil. If fn panics or calls
-// runtime.Goexit, the transaction is rolled back, discarding its writes.
-// Any panic continues to propagate to the caller.
+// If fn panics or calls runtime.Goexit, Update rolls back the transaction and
+// discards its writes. A panic continues to propagate to the caller.
 //
-// Executing a manual commit or rollback from inside the function will result
-// in a panic.
+// A manual commit or rollback inside fn causes a panic.
 func (db *DB) Update(fn func(tx *Tx) error) error {
 	return db.managed(true, fn)
 }
@@ -1433,12 +1480,13 @@ func (db *DB) get(key string) *dbItem {
 	return db.keys.Get(&dbItem{key: key})
 }
 
-// Tx represents a transaction on the database. This transaction can either be
-// read-only or read/write. Read-only transactions can be used for retrieving
-// values for keys and iterating through keys and values. Read/write
-// transactions can set and delete keys.
+// Tx is a transaction on the database. A transaction is read-only or
+// read/write. A read-only transaction gets values and iterates over keys and
+// values. A read/write transaction also sets and deletes items.
 //
-// All transactions must be committed or rolled-back when done.
+// End each read/write transaction with Commit or Rollback. End each read-only
+// transaction with Rollback. The transactions that View and Update run end
+// automatically.
 type Tx struct {
 	db       *DB             // the underlying database.
 	writable bool            // when false mutable operations fail.
@@ -1458,7 +1506,12 @@ type txWriteContext struct {
 	rollbackIndexes map[string]*index  // details for dropped indexes.
 }
 
-// DeleteAll deletes all items from the database.
+// DeleteAll deletes all items from the database. The indexes stay, and they
+// become empty. A rollback of the transaction restores the items.
+//
+// DeleteAll returns ErrTxClosed if the transaction ended. It returns
+// ErrTxNotWritable in a read-only transaction. It returns ErrTxIterating
+// inside an iteration callback.
 func (tx *Tx) DeleteAll() error {
 	if tx.db == nil {
 		return ErrTxClosed
@@ -1493,13 +1546,16 @@ func (tx *Tx) DeleteAll() error {
 	return nil
 }
 
-// Begin opens a new transaction.
-// Multiple read-only transactions can be opened at the same time but there can
-// only be one read/write transaction at a time. Attempting to open a read/write
-// transactions while another one is in progress will result in blocking until
-// the current read/write transaction is completed.
+// Begin starts a new transaction. If writable is true, the transaction is
+// read/write. If writable is false, it is read-only.
 //
-// All transactions must be closed by calling Commit() or Rollback() when done.
+// Many read-only transactions can run at the same time. Only one read/write
+// transaction can run at a time. A read/write transaction waits until all
+// other transactions end.
+//
+// Begin returns ErrDatabaseClosed if the database is closed. End each
+// read/write transaction with Commit or Rollback. End each read-only
+// transaction with Rollback. View and Update do this for you.
 func (db *DB) Begin(writable bool) (*Tx, error) {
 	tx := &Tx{
 		db:       db,
@@ -1571,17 +1627,26 @@ func (tx *Tx) rollbackInner() {
 	}
 }
 
-// Commit writes all changes to disk.
-// An error is returned when a write error occurs, or when a Commit() is called
-// from a read-only transaction.
+// Commit ends a read/write transaction. For a database that persists to disk,
+// it appends the item changes of the transaction to the database file. It does
+// not write index definitions. It returns ErrTxNotWritable for a read-only
+// transaction, and it does not end that transaction. Use Rollback to end a
+// read-only transaction. It returns ErrTxClosed if the transaction already
+// ended. Commit panics inside a function that View or Update runs.
 //
-// Under SyncPolicy Always a failed fsync is also reported. In that case the
-// append itself succeeded and the in-memory changes are kept: the error means
-// durability is unconfirmed, NOT that the transaction was rolled back. Callers
-// must not treat it as a rollback and retry a non-idempotent operation, or
-// they will apply it twice. A write error is never replaced by a later sync
-// result. Subsequent operations remain allowed, but a sync failure does not
-// establish that storage is healthy.
+// If the write fails, Commit rolls back the changes and returns the write
+// error. If a failed write leaves partial data in the file and Commit cannot
+// remove it, Commit panics.
+//
+// Under SyncPolicy Always, Commit also syncs the file, if the commit writes to
+// the file. If that sync fails, Commit returns the sync error. Commit appends
+// the data, and the changes stay in memory. The error means that durability is
+// unconfirmed. It does not mean that the transaction rolled back.
+//
+// Do not treat a sync error as a rollback. A retry of a non-idempotent
+// operation applies it twice. A later sync error never replaces a write error.
+// After a sync error, later operations still run. A failed sync does not show
+// that the storage is healthy.
 func (tx *Tx) Commit() error {
 	if tx.funcd {
 		panic("managed tx commit not allowed")
@@ -1651,10 +1716,10 @@ func (tx *Tx) Commit() error {
 	return err
 }
 
-// Rollback closes the transaction and reverts all mutable operations that
-// were performed on the transaction such as Set() and Delete().
-//
-// Read-only transactions can only be rolled back, not committed.
+// Rollback ends the transaction and reverts all changes that it made, such as
+// Set and Delete. A read-only transaction can only roll back. Rollback returns
+// ErrTxClosed if the transaction already ended. It panics inside a function
+// that View or Update runs.
 func (tx *Tx) Rollback() error {
 	if tx.funcd {
 		panic("managed tx rollback not allowed")
@@ -1888,8 +1953,8 @@ func (idx *index) lessItems(a, b *dbItem) bool {
 	return lessByKey(a, b)
 }
 
-// Rect converts a string to a rectangle.
-// An invalid rectangle will cause a panic.
+// Rect returns the rectangle of the item, as the rect function of the index
+// ctx computes it. It returns nil slices for any other ctx.
 func (dbi *dbItem) Rect(ctx any) (min, max []float64) {
 	switch ctx := ctx.(type) {
 	case *index:
@@ -1898,20 +1963,21 @@ func (dbi *dbItem) Rect(ctx any) (min, max []float64) {
 	return nil, nil
 }
 
-// SetOptions represents options that may be included with the Set() command.
+// SetOptions holds the options of Set.
 type SetOptions struct {
-	// Expires indicates that the Set() key-value will expire
+	// Expires makes the item expire after TTL.
 	Expires bool
-	// TTL is how much time the key-value will exist in the database
-	// before being evicted. The Expires field must also be set to true.
-	// TTL stands for Time-To-Live.
+	// TTL is the time that the item stays in the database before it expires. TTL
+	// has an effect only when Expires is true. TTL stands for time to live. After
+	// the TTL, Get and the iterators skip the item. Get with ignoreExpired set to
+	// true still returns it. The background task deletes it, unless an OnExpired
+	// or OnExpiredSync callback in Config handles it.
 	TTL time.Duration
 }
 
-// GetLess returns the less function for an index. This is handy for
-// doing ad-hoc compares inside a transaction.
-// Returns ErrNotFound if the index is not found or there is no less
-// function bound to the index
+// GetLess returns the less function of an index. Use it to compare two values
+// inside a transaction. It returns ErrNotFound if the index does not exist or
+// has no less function. It returns ErrTxClosed if the transaction ended.
 func (tx *Tx) GetLess(index string) (func(a, b string) bool, error) {
 	if tx.db == nil {
 		return nil, ErrTxClosed
@@ -1923,10 +1989,10 @@ func (tx *Tx) GetLess(index string) (func(a, b string) bool, error) {
 	return idx.less, nil
 }
 
-// GetRect returns the rect function for an index. This is handy for
-// doing ad-hoc searches inside a transaction.
-// Returns ErrNotFound if the index is not found or there is no rect
-// function bound to the index
+// GetRect returns the rect function of an index. Use it to convert a string to
+// a rectangle inside a transaction. It returns ErrNotFound if the index does
+// not exist or has no rect function. It returns ErrTxClosed if the transaction
+// ended.
 func (tx *Tx) GetRect(index string) (func(s string) (min, max []float64),
 	error) {
 	if tx.db == nil {
@@ -1939,17 +2005,18 @@ func (tx *Tx) GetRect(index string) (func(s string) (min, max []float64),
 	return idx.rect, nil
 }
 
-// Set inserts or replaces an item in the database based on the key.
-// The opt params may be used for additional functionality such as forcing
-// the item to be evicted at a specified time. When the return value
-// for err is nil the operation succeeded. When the return value of
-// replaced is true, then the operaton replaced an existing item whose
-// value will be returned through the previousValue variable.
-// The results of this operation will not be available to other
-// transactions until the current transaction has successfully committed.
+// Set inserts an item, or replaces the item with the same key. The opts
+// argument sets extra options, such as an expiration time. It can be nil.
 //
-// Only a writable transaction can be used with this operation.
-// This operation is not allowed during iterations such as Ascend* & Descend*.
+// Set returns err as nil on success. Set returns replaced as true if it
+// replaces an existing item. In that case, previousValue holds the value of
+// the replaced item. Set does not count an expired item as replaced.
+//
+// Other transactions do not see the change until this transaction commits.
+//
+// Set needs a read/write transaction. In a read-only transaction, Set returns
+// ErrTxNotWritable. Inside an iteration callback, such as Ascend, Descend,
+// Intersects or Nearby, Set returns ErrTxIterating.
 func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	replaced bool, err error) {
 	if tx.db == nil {
@@ -1990,9 +2057,9 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	return previousValue, replaced, nil
 }
 
-// Get returns a value for a key. If the item does not exist or if the item
-// has expired then ErrNotFound is returned. If ignoreExpired is true, then
-// the found value will be returned even if it is expired.
+// Get returns the value of a key. It returns ErrNotFound if the item does not
+// exist or has expired. If ignoreExpired is true, Get returns the value of an
+// expired item too.
 func (tx *Tx) Get(key string, ignoreExpired ...bool) (val string, err error) {
 	if tx.db == nil {
 		return "", ErrTxClosed
@@ -2010,11 +2077,13 @@ func (tx *Tx) Get(key string, ignoreExpired ...bool) (val string, err error) {
 	return item.val, nil
 }
 
-// Delete removes an item from the database based on the item's key. If the item
-// does not exist or if the item has expired then ErrNotFound is returned.
+// Delete removes the item with the given key and returns its value. It returns
+// ErrNotFound if the item does not exist or has expired. Delete removes an
+// expired item too, but it still returns ErrNotFound.
 //
-// Only a writable transaction can be used for this operation.
-// This operation is not allowed during iterations such as Ascend* & Descend*.
+// Delete needs a read/write transaction. In a read-only transaction, Delete
+// returns ErrTxNotWritable. Inside an iteration callback, Delete returns
+// ErrTxIterating.
 func (tx *Tx) Delete(key string) (val string, err error) {
 	if tx.db == nil {
 		return "", ErrTxClosed
@@ -2046,9 +2115,9 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 	return item.val, nil
 }
 
-// TTL returns the remaining time-to-live for an item.
-// A negative duration will be returned for items that do not have an
-// expiration.
+// TTL returns the remaining time to live of an item. It returns a duration of
+// -1 for an item that does not expire. It returns ErrNotFound if the item does
+// not exist or has expired.
 func (tx *Tx) TTL(key string) (time.Duration, error) {
 	if tx.db == nil {
 		return 0, ErrTxClosed
@@ -2153,14 +2222,15 @@ func (tx *Tx) scan(desc, gt, lt bool, index, start, stop string,
 	return nil
 }
 
-// Match returns true if the specified key matches the pattern. This is a very
-// simple pattern matcher where '*' matches on any number characters and '?'
-// matches on any one character.
+// Match returns true if key matches pattern. In the pattern, '*' matches any
+// number of characters, and '?' matches any one character.
 func Match(key, pattern string) bool {
 	return match.Match(key, pattern)
 }
 
-// AscendKeys allows for iterating through keys based on the specified pattern.
+// AscendKeys calls iterator for every item whose key matches pattern, in
+// ascending key order, until iterator returns false. It skips expired items.
+// An empty pattern matches no key, and AscendKeys returns nil.
 func (tx *Tx) AscendKeys(pattern string,
 	iterator func(key, value string) bool) error {
 	if pattern == "" {
@@ -2193,7 +2263,9 @@ func (tx *Tx) AscendKeys(pattern string,
 	})
 }
 
-// DescendKeys allows for iterating through keys based on the specified pattern.
+// DescendKeys calls iterator for every item whose key matches pattern, in
+// descending key order, until iterator returns false. It skips expired items.
+// An empty pattern matches no key, and DescendKeys returns nil.
 func (tx *Tx) DescendKeys(pattern string,
 	iterator func(key, value string) bool) error {
 	if pattern == "" {
@@ -2226,45 +2298,48 @@ func (tx *Tx) DescendKeys(pattern string,
 	})
 }
 
-// Ascend calls the iterator for every item in the database within the range
-// [first, last], until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// Ascend calls iterator for every item in the database, from first to last,
+// until iterator returns false.
+//
+// If index is not empty, the order follows the less function of that index. If
+// index is empty, the order follows the key. The function skips expired items.
+// It returns ErrNotFound if the index does not exist.
 func (tx *Tx) Ascend(index string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(false, false, false, index, "", "", iterator)
 }
 
-// AscendGreaterOrEqual calls the iterator for every item in the database within
-// the range [pivot, last], until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// AscendGreaterOrEqual calls iterator for every item in the range [pivot,
+// last], until iterator returns false.
+//
+// If index is empty, the order follows the key, and the pivot is a key. If
+// index is not empty, the order follows the less function of that index, and
+// the pivot is a value that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist.
 func (tx *Tx) AscendGreaterOrEqual(index, pivot string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(false, true, false, index, pivot, "", iterator)
 }
 
-// AscendLessThan calls the iterator for every item in the database within the
-// range [first, pivot), until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// AscendLessThan calls iterator for every item in the range [first, pivot),
+// until iterator returns false.
+//
+// If index is empty, the order follows the key, and the pivot is a key. If
+// index is not empty, the order follows the less function of that index, and
+// the pivot is a value that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist.
 func (tx *Tx) AscendLessThan(index, pivot string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(false, false, true, index, pivot, "", iterator)
 }
 
-// AscendRange calls the iterator for every item in the database within
-// the range [greaterOrEqual, lessThan), until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// AscendRange calls iterator for every item in the range [greaterOrEqual,
+// lessThan), until iterator returns false.
+//
+// If index is empty, the order follows the key, and the bounds are keys. If
+// index is not empty, the order follows the less function of that index, and
+// the bounds are values that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist.
 func (tx *Tx) AscendRange(index, greaterOrEqual, lessThan string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(
@@ -2272,45 +2347,49 @@ func (tx *Tx) AscendRange(index, greaterOrEqual, lessThan string,
 	)
 }
 
-// Descend calls the iterator for every item in the database within the range
-// [last, first], until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// Descend calls iterator for every item in the database, from last to first,
+// until iterator returns false.
+//
+// If index is not empty, the order follows the less function of that index. If
+// index is empty, the order follows the key. The function skips expired items.
+// It returns ErrNotFound if the index does not exist.
 func (tx *Tx) Descend(index string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(true, false, false, index, "", "", iterator)
 }
 
-// DescendGreaterThan calls the iterator for every item in the database within
-// the range [last, pivot), until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// DescendGreaterThan calls iterator for every item in the range [last, pivot),
+// until iterator returns false. The items are greater than pivot.
+//
+// If index is empty, the order follows the key, and the pivot is a key. If
+// index is not empty, the order follows the less function of that index, and
+// the pivot is a value that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist.
 func (tx *Tx) DescendGreaterThan(index, pivot string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(true, true, false, index, pivot, "", iterator)
 }
 
-// DescendLessOrEqual calls the iterator for every item in the database within
-// the range [pivot, first], until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// DescendLessOrEqual calls iterator for every item in the range [pivot,
+// first], until iterator returns false.
+//
+// If index is empty, the order follows the key, and the pivot is a key. If
+// index is not empty, the order follows the less function of that index, and
+// the pivot is a value that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist.
 func (tx *Tx) DescendLessOrEqual(index, pivot string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(true, false, true, index, pivot, "", iterator)
 }
 
-// DescendRange calls the iterator for every item in the database within
-// the range [lessOrEqual, greaterThan), until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// DescendRange calls iterator for every item in the range [lessOrEqual,
+// greaterThan), until iterator returns false. The items are less than or equal
+// to lessOrEqual, and greater than greaterThan.
+//
+// If index is empty, the order follows the key, and the bounds are keys. If
+// index is not empty, the order follows the less function of that index, and
+// the bounds are values that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist.
 func (tx *Tx) DescendRange(index, lessOrEqual, greaterThan string,
 	iterator func(key, value string) bool) error {
 	return tx.scan(
@@ -2318,12 +2397,14 @@ func (tx *Tx) DescendRange(index, lessOrEqual, greaterThan string,
 	)
 }
 
-// AscendEqual calls the iterator for every item in the database that equals
-// pivot, until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// AscendEqual calls iterator for every item that equals pivot, in ascending
+// order, until iterator returns false.
+//
+// If index is empty, the order follows the key, and the pivot is a key. If
+// index is not empty, the order follows the less function of that index, and
+// the pivot is a value that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist or has no less
+// function.
 func (tx *Tx) AscendEqual(index, pivot string,
 	iterator func(key, value string) bool) error {
 	var err error
@@ -2346,12 +2427,14 @@ func (tx *Tx) AscendEqual(index, pivot string,
 	})
 }
 
-// DescendEqual calls the iterator for every item in the database that equals
-// pivot, until iterator returns false.
-// When an index is provided, the results will be ordered by the item values
-// as specified by the less() function of the defined index.
-// When an index is not provided, the results will be ordered by the item key.
-// An invalid index will return an error.
+// DescendEqual calls iterator for every item that equals pivot, in descending
+// order, until iterator returns false.
+//
+// If index is empty, the order follows the key, and the pivot is a key. If
+// index is not empty, the order follows the less function of that index, and
+// the pivot is a value that the function compares. The function skips expired
+// items. It returns ErrNotFound if the index does not exist or has no less
+// function.
 func (tx *Tx) DescendEqual(index, pivot string,
 	iterator func(key, value string) bool) error {
 	var err error
@@ -2383,25 +2466,27 @@ func (r *rect) Rect(ctx any) (min, max []float64) {
 	return r.min, r.max
 }
 
-// Nearby searches for rectangle items that are nearby a target rect.
-// All items belonging to the specified index will be returned in order of
-// nearest to farthest.
-// The specified index must have been created by AddIndex() and the target
-// is represented by the rect string. This string will be processed by the
-// same bounds function that was passed to the CreateSpatialIndex() function.
-// An invalid index will return an error.
-// The dist param is the distance of the bounding boxes. In the case of
-// simple 2D points, it's the distance of the two 2D points squared.
+// Nearby searches a spatial index for items near a target rectangle. It calls
+// iterator for every item, from nearest to farthest, until iterator returns
+// false.
 //
-// Nearby skips expired items, as Get does. It checks expiry against one clock
-// reading per call. The search stops when the iterator returns false.
+// The bounds string describes the target. Nearby converts it with the rect
+// function that CreateSpatialIndex received. The dist argument is the squared
+// distance between the bounding boxes. For two 2-D points, it is the squared
+// distance between the points.
 //
-// In a writable transaction, Set and Delete return ErrTxIterating inside the
-// iterator. In a read-only transaction, they return ErrTxNotWritable.
+// Nearby returns ErrNotFound if the index does not exist. If index is empty or
+// is not a spatial index, Nearby returns nil and does not call iterator.
+//
+// Nearby skips expired items, as Get does. It checks expiration against one
+// clock reading for each call.
+//
+// A write inside the iterator returns ErrTxIterating in a read/write
+// transaction. In a read-only transaction, it returns ErrTxNotWritable.
 //
 // Nearby sorts by distance only among items with the same number of
-// dimensions. An index that holds rects of different dimensions can return
-// them out of order.
+// dimensions. An index that holds rectangles with different numbers of
+// dimensions can return items out of order.
 //
 // In such an index, an iterator that panics or calls runtime.Goexit can leak
 // goroutines. testing.T.Fatal calls runtime.Goexit. Keep fatal assertions out
@@ -2452,17 +2537,23 @@ func (tx *Tx) Nearby(index, bounds string,
 	return nil
 }
 
-// Intersects searches for rectangle items that intersect a target rect.
-// The specified index must have been created by AddIndex() and the target
-// is represented by the rect string. This string will be processed by the
-// same bounds function that was passed to the CreateSpatialIndex() function.
-// An invalid index will return an error.
+// Intersects searches a spatial index for items that intersect a target
+// rectangle. It calls iterator for every such item until iterator returns
+// false.
 //
-// Intersects skips expired items, as Get does. It checks expiry against one
-// clock reading per call. The search stops when the iterator returns false.
+// The bounds string describes the target. Intersects converts it with the rect
+// function that CreateSpatialIndex received.
 //
-// In a writable transaction, Set and Delete return ErrTxIterating inside the
-// iterator. In a read-only transaction, they return ErrTxNotWritable.
+// Intersects returns ErrNotFound if the index does not exist. If index is
+// empty or is not a spatial index, Intersects returns nil and does not call
+// iterator.
+//
+// Intersects skips expired items, as Get does. It checks expiration against
+// one clock reading for each call. The search stops when the iterator returns
+// false.
+//
+// A write inside the iterator returns ErrTxIterating in a read/write
+// transaction. In a read-only transaction, it returns ErrTxNotWritable.
 func (tx *Tx) Intersects(index, bounds string,
 	iterator func(key, value string) bool) error {
 	if tx.db == nil {
@@ -2505,7 +2596,8 @@ func (tx *Tx) Intersects(index, bounds string,
 	return nil
 }
 
-// Len returns the number of items in the database
+// Len returns the number of items in the database. The count includes expired
+// items that the background task has not yet deleted.
 func (tx *Tx) Len() (int, error) {
 	if tx.db == nil {
 		return 0, ErrTxClosed
@@ -2513,63 +2605,75 @@ func (tx *Tx) Len() (int, error) {
 	return tx.db.keys.Len(), nil
 }
 
-// IndexOptions provides an index with additional features or
-// alternate functionality.
+// IndexOptions sets extra options for an index.
 type IndexOptions struct {
-	// CaseInsensitiveKeyMatching allow for case-insensitive
-	// matching on keys when setting key/values.
+	// CaseInsensitiveKeyMatching makes the index match keys without regard to
+	// case. The index converts the pattern to lower case when you create the
+	// index. It converts a key to lower case only if the key holds an ASCII upper
+	// case letter. A key with only non-ASCII upper case letters stays unchanged,
+	// so a pattern with such letters can miss it.
 	CaseInsensitiveKeyMatching bool
 }
 
-// CreateIndex builds a new index and populates it with items.
-// The items are ordered in an b-tree and can be retrieved using the
-// Ascend* and Descend* methods.
-// An error will occur if an index with the same name already exists.
+// CreateIndex builds a new index and fills it with items. The index orders the
+// items in a B-tree. Read them with the Ascend and Descend functions.
+// CreateIndex returns ErrIndexExists if an index with the same name exists, or
+// if the name is empty.
 //
-// When a pattern is provided, the index will be populated with
-// keys that match the specified pattern. This is a very simple pattern
-// match where '*' matches on any number characters and '?' matches on
-// any one character.
-// The less function compares if string 'a' is less than string 'b'.
-// It allows for indexes to create custom ordering. It's possible
-// that the strings may be textual or binary. It's up to the provided
-// less function to handle the content format and comparison.
-// There are some default less function that can be used such as
-// IndexString, IndexBinary, etc.
+// The pattern selects the keys that the index holds. In the pattern, '*'
+// matches any number of characters, and '?' matches any one character.
+//
+// The less function returns true if string a sorts before string b. It sets
+// the order of the index. The strings can hold text or binary data. The less
+// function must handle the format of its data. IndexString, IndexBinary,
+// IndexInt, IndexUint and IndexFloat are ready-made less functions. IndexJSON
+// and IndexJSONCaseSensitive return less functions. Call one with a path, for
+// example IndexJSON("age").
+//
+// If you pass more than one less function, the index orders by the first. It
+// uses each next function only when the earlier ones find the values equal.
+// Items with equal values sort by key.
+//
+// CreateIndex returns ErrTxNotWritable in a read-only transaction. It returns
+// ErrTxIterating inside an iteration callback.
 func (tx *Tx) CreateIndex(name, pattern string,
 	less ...func(a, b string) bool) error {
 	return tx.createIndex(name, pattern, less, nil, nil)
 }
 
-// CreateIndexOptions is the same as CreateIndex except that it allows
-// for additional options.
+// CreateIndexOptions is the same as CreateIndex, with the extra argument opts.
+// A nil opts uses the default options.
 func (tx *Tx) CreateIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	less ...func(a, b string) bool) error {
 	return tx.createIndex(name, pattern, less, nil, opts)
 }
 
-// CreateSpatialIndex builds a new index and populates it with items.
-// The items are organized in an r-tree and can be retrieved using the
-// Intersects method.
-// An error will occur if an index with the same name already exists.
+// CreateSpatialIndex builds a new spatial index and fills it with items. The
+// index stores the items in an R-tree. Search them with Intersects and Nearby.
+// CreateSpatialIndex returns ErrIndexExists if an index with the same name
+// exists, or if the name is empty.
 //
-// The rect function converts a string to a rectangle. The rectangle is
-// represented by two arrays, min and max. Both arrays may have a length
-// between 1 and 20, and both arrays must match in length. A length of 1 is a
-// one dimensional rectangle, and a length of 4 is a four dimension rectangle.
-// There is support for up to 20 dimensions.
-// The values of min must be less than the values of max at the same dimension.
-// Thus min[0] must be less-than-or-equal-to max[0].
-// The IndexRect is a default function that can be used for the rect
-// parameter.
+// The rect function converts the value of an item to a rectangle. It returns
+// the rectangle as two slices, min and max. Each slice has 1 to 20 values, one
+// for each dimension. Both slices must have the same length. A length of 1 is
+// a one-dimensional rectangle. A length of 4 is a four-dimensional rectangle.
+//
+// At each dimension, the value of min must be less than or equal to the value
+// of max. For example, min[0] must be less than or equal to max[0].
+//
+// The index does not hold an item whose slices have different lengths, or a
+// length of 0 or more than 20. IndexRect is a ready-made rect function.
+//
+// CreateSpatialIndex returns ErrTxNotWritable in a read-only transaction. It
+// returns ErrTxIterating inside an iteration callback.
 func (tx *Tx) CreateSpatialIndex(name, pattern string,
 	rect func(item string) (min, max []float64)) error {
 	return tx.createIndex(name, pattern, nil, rect, nil)
 }
 
-// CreateSpatialIndexOptions is the same as CreateSpatialIndex except that
-// it allows for additional options.
+// CreateSpatialIndexOptions is the same as CreateSpatialIndex, with the extra
+// argument opts. A nil opts uses the default options.
 func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	rect func(item string) (min, max []float64)) error {
@@ -2654,7 +2758,10 @@ func (tx *Tx) createIndex(name string, pattern string,
 	return nil
 }
 
-// DropIndex removes an index.
+// DropIndex removes an index. It returns ErrNotFound if the index does not
+// exist. It returns ErrInvalidOperation if name is empty. It returns
+// ErrTxNotWritable in a read-only transaction, and ErrTxIterating inside an
+// iteration callback.
 func (tx *Tx) DropIndex(name string) error {
 	if tx.db == nil {
 		return ErrTxClosed
@@ -2688,7 +2795,7 @@ func (tx *Tx) DropIndex(name string) error {
 	return nil
 }
 
-// Indexes returns a list of index names.
+// Indexes returns the names of the indexes in sorted order.
 func (tx *Tx) Indexes() ([]string, error) {
 	if tx.db == nil {
 		return nil, ErrTxClosed
@@ -2701,31 +2808,30 @@ func (tx *Tx) Indexes() ([]string, error) {
 	return names, nil
 }
 
-// Rect is helper function that returns a string representation
-// of a rect. IndexRect() is the reverse function and can be used
-// to generate a rect from a string.
+// Rect returns the string form of a rectangle with the given min and max.
+// IndexRect is the reverse function: it converts the string to a rectangle.
 func Rect(min, max []float64) string {
 	r := grect.Rect{Min: min, Max: max}
 	return r.String()
 }
 
-// Point is a helper function that converts a series of float64s
-// to a rectangle for a spatial index.
+// Point returns the string form of a point with the given coordinates. The
+// point is a rectangle with equal min and max.
 func Point(coords ...float64) string {
 	return Rect(coords, coords)
 }
 
-// IndexRect is a helper function that converts string to a rect.
-// Rect() is the reverse function and can be used to generate a string
-// from a rect.
+// IndexRect converts a string to a rectangle. It is a ready-made rect function
+// for CreateSpatialIndex. Rect is the reverse function: it converts a
+// rectangle to a string.
 func IndexRect(a string) (min, max []float64) {
 	r := grect.Get(a)
 	return r.Min, r.Max
 }
 
-// IndexString is a helper function that return true if 'a' is less than 'b'.
-// This is a case-insensitive comparison. Use the IndexBinary() for comparing
-// case-sensitive strings.
+// IndexString is a less function. It returns true if a is less than b. The
+// comparison ignores the case of ASCII letters. Use IndexBinary for a
+// case-sensitive comparison.
 func IndexString(a, b string) bool {
 	for i := 0; i < len(a) && i < len(b); i++ {
 		if a[i] >= 'A' && a[i] <= 'Z' {
@@ -2763,57 +2869,60 @@ func IndexString(a, b string) bool {
 	return len(a) < len(b)
 }
 
-// IndexBinary is a helper function that returns true if 'a' is less than 'b'.
-// This compares the raw binary of the string.
+// IndexBinary is a less function. It returns true if a is less than b, when it
+// compares the raw bytes of the strings.
 func IndexBinary(a, b string) bool {
 	return a < b
 }
 
-// IndexInt is a helper function that returns true if 'a' is less than 'b'.
+// IndexInt is a less function. It returns true if a is less than b, when it
+// compares the strings as base-10 int64 values. A string with invalid syntax
+// counts as 0.
 func IndexInt(a, b string) bool {
 	ia, _ := strconv.ParseInt(a, 10, 64)
 	ib, _ := strconv.ParseInt(b, 10, 64)
 	return ia < ib
 }
 
-// IndexUint is a helper function that returns true if 'a' is less than 'b'.
-// This compares uint64s that are added to the database using the
-// Uint() conversion function.
+// IndexUint is a less function. It returns true if a is less than b, when it
+// compares the strings as base-10 uint64 values. A string with invalid syntax
+// counts as 0.
 func IndexUint(a, b string) bool {
 	ia, _ := strconv.ParseUint(a, 10, 64)
 	ib, _ := strconv.ParseUint(b, 10, 64)
 	return ia < ib
 }
 
-// IndexFloat is a helper function that returns true if 'a' is less than 'b'.
-// This compares float64s that are added to the database using the
-// Float() conversion function.
+// IndexFloat is a less function. It returns true if a is less than b, when it
+// compares the strings as float64 values. A string with invalid syntax counts
+// as 0.
 func IndexFloat(a, b string) bool {
 	ia, _ := strconv.ParseFloat(a, 64)
 	ib, _ := strconv.ParseFloat(b, 64)
 	return ia < ib
 }
 
-// IndexJSON provides for the ability to create an index on any JSON field.
-// When the field is a string, the comparison will be case-insensitive.
-// It returns a helper function used by CreateIndex.
+// IndexJSON returns a less function that compares the JSON field at path in
+// two values. The path uses the GJSON syntax. A string field compares without
+// regard to the case of ASCII letters. Call IndexJSON with a path. Pass the
+// result to CreateIndex. Do not pass IndexJSON itself.
 func IndexJSON(path string) func(a, b string) bool {
 	return func(a, b string) bool {
 		return gjson.Get(a, path).Less(gjson.Get(b, path), false)
 	}
 }
 
-// IndexJSONCaseSensitive provides for the ability to create an index on
-// any JSON field.
-// When the field is a string, the comparison will be case-sensitive.
-// It returns a helper function used by CreateIndex.
+// IndexJSONCaseSensitive returns a less function that compares the JSON field
+// at path in two values. The path uses the GJSON syntax. A string field
+// compares with regard to case. Call IndexJSONCaseSensitive with a path. Pass
+// the result to CreateIndex. Do not pass IndexJSONCaseSensitive itself.
 func IndexJSONCaseSensitive(path string) func(a, b string) bool {
 	return func(a, b string) bool {
 		return gjson.Get(a, path).Less(gjson.Get(b, path), true)
 	}
 }
 
-// Desc is a helper function that changes the order of an index.
+// Desc returns a less function with the opposite order of less.
 func Desc(less func(a, b string) bool) func(a, b string) bool {
 	return func(a, b string) bool { return less(b, a) }
 }
